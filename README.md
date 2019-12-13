@@ -68,7 +68,7 @@ The editor tools work via ECS, creating an editor mode world if needed.  The Ecs
 
 **Crowd**
 
-For the crowd there is a sample system for how to control agents, and a simple MB component that shows how to access agent data from the main thread (mainly there for testing).  Also one of the core crowd jobs that manages pathing isn't using burst.  Burst changed their api to not allow passing value types via PInvoke.  It's a rather simple fix to get it compatible just haven't gotten around to it.
+For the crowd there is a sample system for how to control agents, and a simple MB component that shows how to access agent data from the main thread (mainly there for testing).  
 
 
 **Queries**
