@@ -8,6 +8,8 @@ AiNav is 3 separate libraries.
  - C# project that is not dependent on Unity that has the core interop and navmesh building  flow. (AiNavCore)
  - C# ECS based project that integrates it all with Unity.   Includes navmesh building, pathfinding, and crowd management. (AiNav)
 
+There are no fully working examples, the sample scene just has a surface and the required EcsWorld component needed for editing.  You need to create input geometry to actually do anything.  A few mesh sources should suffice.
+
 **Focus**
 
 AiNav was created primarily to make runtime tile building fast and low impact.  And to be able to use the detour crowd in Unity jobs, keeping it off the main thread.
