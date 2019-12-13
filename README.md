@@ -1,19 +1,33 @@
 
+
+**License**
+
+Unity Companion License
+
+AiNav borrowed a good chunk of code from Xenko although it's been heavily modified for the most part.  That was under the MIT license.  Recast is the Zlib license.  AiNativeArray/AiNativeList borrow heavily from Unity's container design. 
+
+**Structure**
+
 AiNav is 3 separate libraries really.
 
  - C++ project integrating with recastnavigation.
- - C# project that is not dependent on Unity that has the core interop and navmesh building    flow.
+ - C# project that is not dependent on Unity that has the core interop and navmesh building  flow.
  - C# ECS based project that integrates it all with Unity.   Includes navmesh building, pathfinding, and crowd management.
 
 **Focus**
 
-AiNav was created to to solve very specific problems for a specific game.  It is not a drop in replacement for Unity's navmesh system.  It won't do everything Unity's navmesh does.  And what it does do it won't necessarily do better.  It depends.  Building within the design constraints is significantly better, and the crowd is handled completely in the job system. 
+AiNav was created primarily to make runtime tile building fast and low impact.  And to be able to use the detour crowd in Unity jobs, keeping it off the main thread.
 
-The ECS side comes by default with code that relies on a modified version of Unity.Physics.  No functional changes at all but it has to open up access to a few internal data structures.  
+It is not a drop in replacement for Unity's navmesh system.  Design decisions especially in the build process were very specific.   Unity's behavior is not going to match up all the time.  Unity's system is based on recast also, but it's likely seen a number of modifications.
 
-The primary goal of AiNav was to make runtime tile building faster.  Rebuilding small numbers of tiles frequently without causing any impact on gameplay.  It builds single tiles at a time.  It wants geometry that is already partitioned to something not that different then the navmesh tile size.  So that it doesn't have to spend time filtering unnecessary geometry.  It's not optimized for design time build speeds, and you can't just throw anything at it like huge terrain colliders.  If a tile bounds intersects a collider or source mesh bounds, it's going to filter against every single vertice.  
+ The building is optimized for frequent updates of small numbers of tiles at runtime.  It expects you to feed it already optimized geometry that is not much larger then the tile size.  If you feed it geometry far larger then the tile size it's going to perform badly.
 
-A secondary goal was basic crowd support that is off the main thread.
+The ECS side comes by default with code that relies on a modified version of Unity.Physics.  No functional changes were made but it has to open up access to a few internal data structures.  This part can fairly easily be commented out or removed.   You can drive everything via mesh sources if you want.
+
+**Unsafe**
+
+There is a lot of unsafe code and a decent amount of C++ code.  You were warned.
+
 
 **Basic Usage:**
 
@@ -23,7 +37,10 @@ The navigation meshes use a surface abstraction.  Each surface in a scene having
  -  SaveSourcesAndFilters
  -  Build
 
+Tiles are persisted to streaming assets.  On play the surface MB component will trigger creating the surface controller, and the navmesh will be automatically loaded.
+
 **Sources**
+
 AiNav supports Unity.Physics collider sources, or mesh sources.  The former is baked in.  The latter you provide.  You can provide mesh sources via subclassing MeshSourceAuthorBase.  When you save sources and filters on the surface component, it will gather all mesh source authors in the scene.  There is a simple mesh source author implementation included.  
 
 Layers are supported but primarily for the Unity.Physics support.  It convers the layer and masks to CollisionFilter's and then filters physics geometry by that in addition to tile bounds.
@@ -32,7 +49,8 @@ Mesh sources can be shared or non shared. SharedMeshDb is where you configure sh
 
 You can also set a mesh source to not be collected by the surface.  That's there mainly for testing actually but you might find a practical use for it.
 
-The surface controller also has methods to add/remove sources at runtime.  When you add an input it assigns an id, so you can then use that id to remove the input.  You can also set custom data on the mesh source, and there is a lookup by custom data method on the surface controller.
+The surface controller also has methods to add/remove sources at runtime.  When you add a source it assigns an id, so you can then use that id to remove the source.  You can also set custom data on the mesh source, and there is a lookup by custom data method on the surface controller.
+
 
 **Filters**
 
@@ -59,7 +77,7 @@ For the crowd there is a sample system for how to control agents, and a simple M
 
 **Queries**
 
-Navmesh queries are inherently linked to surfaces.  That's just how recast works and why Unity's implementation has a concept of allocating a query.  When a surface is destroyed in AiNav it marks all queries tied to it as invalid.  It's not disposed you still need to do that, but it will prevent usage of the query so as not to try and reference an invalid pointer.
+Navmesh queries are inherently linked to surfaces.  That's just how recast works and why Unity's implementation has a concept of allocating a query.  When a surface is destroyed AiNav marks all queries tied to it as invalid.  It's not disposed you still need to do that, but it will prevent usage of the query so as not to try and reference an invalid pointer.
 
 Jobs  running queries should call AddQueryDependency on the surface controller. 
 
@@ -73,10 +91,11 @@ AiNav persists it's data using the entities binary serialization.  The data stor
 
 **AiNativeArray/AiNativeList**
 
-I threw these in because they solved the problem of I want the core usable outside Unity, and I want to iterate on the interop stuff outside of Unity also.  So these are api compatible for the most part, and outside of I think one usage in the core building flow, optional.  Any/all usages are easy to replace with Unity's containers being the core api's are the same and a lot of the internal stuff winds up in unsafe pointers.
+I threw these in because they solved the problem of I want the core usable outside Unity, and I want to iterate on the interop stuff outside of Unity also.  So these are api compatible for the most part, and outside of I think one usage in the core building flow, optional.  Any/all usages are easy to replace with Unity's containers if you so desire.
 
 **What's Missing**
 
 Query filters are the main obvious thing.  That and better support for regions.
 
-Obstacles.   The official obstacle approach in recast is this whole other tile cache approach that adds significant work.  I'm not sure yet what the best approach is here.  Tile rebuilding is fast enough that I think it will work just fine for use cases like doors.  Moving obstacles we just don't have a use case for, so no compelling reason to investigate that more.
+Obstacles.   Tile rebuilds are fast enough that for our needs we don't need obstacle support per say.  So no plans for this.  The recast way involves creating special cache tiles that are a different thing then regular tiles and would require a whole separate build flow and more interop. 
+
