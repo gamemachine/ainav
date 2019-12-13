@@ -1,0 +1,31 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 16
+VisualStudioVersion = 16.0.29519.87
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "AiNav", "AiNav.vcxproj", "{FE4A6EFA-0093-4059-9B3E-FD37EB2DE1DD}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Debug|x86 = Debug|x86
+		Release|x64 = Release|x64
+		Release|x86 = Release|x86
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{FE4A6EFA-0093-4059-9B3E-FD37EB2DE1DD}.Debug|x64.ActiveCfg = Debug|x64
+		{FE4A6EFA-0093-4059-9B3E-FD37EB2DE1DD}.Debug|x64.Build.0 = Debug|x64
+		{FE4A6EFA-0093-4059-9B3E-FD37EB2DE1DD}.Debug|x86.ActiveCfg = Debug|Win32
+		{FE4A6EFA-0093-4059-9B3E-FD37EB2DE1DD}.Debug|x86.Build.0 = Debug|Win32
+		{FE4A6EFA-0093-4059-9B3E-FD37EB2DE1DD}.Release|x64.ActiveCfg = Release|x64
+		{FE4A6EFA-0093-4059-9B3E-FD37EB2DE1DD}.Release|x64.Build.0 = Release|x64
+		{FE4A6EFA-0093-4059-9B3E-FD37EB2DE1DD}.Release|x86.ActiveCfg = Release|Win32
+		{FE4A6EFA-0093-4059-9B3E-FD37EB2DE1DD}.Release|x86.Build.0 = Release|Win32
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {519176CB-C8C9-4D8A-8C02-8587E32180BC}
+	EndGlobalSection
+EndGlobal
