@@ -1,11 +1,14 @@
 
+
 **Structure**
 
-AiNav is 3 separate libraries really.
+AiNav is 3 separate libraries.
 
- - C++ project integrating with recastnavigation.
- - C# project that is not dependent on Unity that has the core interop and navmesh building  flow.
- - C# ECS based project that integrates it all with Unity.   Includes navmesh building, pathfinding, and crowd management.
+ - C++ project integrating with recastnavigation. (AiNavInterop)
+ - C# project that is not dependent on Unity that has the core interop and navmesh building  flow. (AiNavCore)
+ - C# ECS based project that integrates it all with Unity.   Includes navmesh building, pathfinding, and crowd management. (AiNav)
+
+There are no fully working examples, the sample scene just has a surface and the required EcsWorld component needed for editing.  You need to create input geometry to actually do anything.  A few mesh sources should suffice.
 
 **Focus**
 
