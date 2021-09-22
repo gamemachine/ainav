@@ -1,17 +1,18 @@
-﻿using System;
+﻿#if !HAVOK_PHYSICS_EXISTS
+
 using Unity.Burst;
 using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
 using Unity.Entities;
 using Unity.Jobs;
-using Unity.Mathematics;
 using Unity.Physics.Systems;
 
 namespace Unity.Physics.Authoring
 {
     // A system which draws any collision events produced by the physics step system
+    [UpdateInGroup(typeof(FixedStepSimulationSystemGroup))]
     [UpdateAfter(typeof(StepPhysicsWorld)), UpdateBefore(typeof(EndFramePhysicsSystem))]
-    public class DisplayCollisionEventsSystem : JobComponentSystem
+    public class DisplayCollisionEventsSystem : SystemBase
     {
         BuildPhysicsWorld m_BuildPhysicsWorldSystem;
         StepPhysicsWorld m_StepPhysicsWorldSystem;
@@ -26,56 +27,48 @@ namespace Unity.Physics.Authoring
             m_DebugStreamSystem = World.GetOrCreateSystem<DebugStream>();
         }
 
-        protected override JobHandle OnUpdate(JobHandle inputDeps)
+        protected override void OnUpdate()
         {
             if (!(HasSingleton<PhysicsDebugDisplayData>() && GetSingleton<PhysicsDebugDisplayData>().DrawCollisionEvents != 0))
             {
-                return inputDeps;
+                return;
             }
-
-            DebugStream.Context debugOutput = m_DebugStreamSystem.GetContext(1);
-            debugOutput.Begin(0);
 
             unsafe
             {
                 // Allocate a block of memory to store our debug output, so it can be shared across the display/finish jobs
                 var sharedOutput = (DebugStream.Context*)UnsafeUtility.Malloc(sizeof(DebugStream.Context), 16, Allocator.TempJob);
-                sharedOutput[0] = debugOutput;
+                *sharedOutput = m_DebugStreamSystem.GetContext(1);
+                sharedOutput->Begin(0);
 
-                var job = new DisplayCollisionEventsJob
+                // This will call the extension method defined in Unity.Physics
+                JobHandle handle = new DisplayCollisionEventsJob
                 {
                     World = m_BuildPhysicsWorldSystem.PhysicsWorld,
                     OutputStreamContext = sharedOutput
-                };
-
-                JobHandle handle = ScheduleCollisionEventsJob(job, m_StepPhysicsWorldSystem.Simulation, ref m_BuildPhysicsWorldSystem.PhysicsWorld, inputDeps);
+                }.Schedule(m_StepPhysicsWorldSystem.Simulation, ref m_BuildPhysicsWorldSystem.PhysicsWorld, Dependency);
 
 #pragma warning disable 618
+
                 JobHandle finishHandle = new FinishDisplayCollisionEventsJob
                 {
                     OutputStreamContext = sharedOutput
                 }.Schedule(handle);
 #pragma warning restore 618
 
-                m_EndFramePhysicsSystem.HandlesToWaitFor.Add(finishHandle);
+                m_EndFramePhysicsSystem.AddInputDependency(finishHandle);
 
-                return handle;
+                Dependency = handle;
             }
-        }
-
-        protected virtual JobHandle ScheduleCollisionEventsJob(DisplayCollisionEventsJob job, ISimulation simulation, ref PhysicsWorld world, JobHandle inDeps)
-        {
-            // Explicitly call ScheduleImpl here, to avoid a dependency on Havok.Physics
-            return job.ScheduleImpl(simulation, ref world, inDeps);
         }
 
         // Job which iterates over collision events and writes display info to a DebugStream.
         [BurstCompile]
-        protected unsafe struct DisplayCollisionEventsJob : ICollisionEventsJob
+        private unsafe struct DisplayCollisionEventsJob : ICollisionEventsJobBase
         {
             [ReadOnly] public PhysicsWorld World;
             [NativeDisableUnsafePtrRestriction]
-            internal DebugStream.Context* OutputStreamContext;
+            public DebugStream.Context* OutputStreamContext;
 
             public unsafe void Execute(CollisionEvent collisionEvent)
             {
@@ -85,17 +78,17 @@ namespace Unity.Physics.Authoring
                 // vertex - blue
                 // edge - cyan
                 // face - magenta
-                UnityEngine.Color color;
-                switch(details.EstimatedContactPointPositions.Length)
+                Unity.DebugDisplay.ColorIndex color;
+                switch (details.EstimatedContactPointPositions.Length)
                 {
                     case 1:
-                        color = UnityEngine.Color.blue;
+                        color = Unity.DebugDisplay.ColorIndex.Blue;
                         break;
                     case 2:
-                        color = UnityEngine.Color.cyan;
+                        color = Unity.DebugDisplay.ColorIndex.Cyan;
                         break;
                     default:
-                        color = UnityEngine.Color.magenta;
+                        color = Unity.DebugDisplay.ColorIndex.Magenta;
                         break;
                 }
 
@@ -106,8 +99,7 @@ namespace Unity.Physics.Authoring
         }
 
         [BurstCompile]
-        [Obsolete("This type will be made protected in a future release. (RemovedAfter 2019-10-15)")]
-        public unsafe struct FinishDisplayCollisionEventsJob : IJob
+        private unsafe struct FinishDisplayCollisionEventsJob : IJob
         {
             [NativeDisableUnsafePtrRestriction]
             internal DebugStream.Context* OutputStreamContext;
@@ -120,3 +112,5 @@ namespace Unity.Physics.Authoring
         }
     }
 }
+
+#endif

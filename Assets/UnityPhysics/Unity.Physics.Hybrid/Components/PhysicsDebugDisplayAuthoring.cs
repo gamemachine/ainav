@@ -18,7 +18,7 @@ namespace Unity.Physics.Authoring
 
     [AddComponentMenu("DOTS/Physics/Physics Debug Display")]
     [DisallowMultipleComponent]
-    [RequiresEntityConversion]
+    [HelpURL(HelpURLs.PhysicsDebugDisplayAuthoring)]
     public sealed class PhysicsDebugDisplayAuthoring : MonoBehaviour, IConvertGameObjectToEntity
     {
         PhysicsDebugDisplayAuthoring() { }
@@ -46,8 +46,8 @@ namespace Unity.Physics.Authoring
             DrawJoints = DrawJoints ? 1 : 0
         };
 
-        private Entity m_ConvertedEntity = Entity.Null;
-        private EntityManager m_ConvertedEntityManager = null;
+        Entity m_ConvertedEntity = Entity.Null;
+        EntityManager m_ConvertedEntityManager;
 
         void IConvertGameObjectToEntity.Convert(Entity entity, EntityManager dstManager, GameObjectConversionSystem conversionSystem)
         {
@@ -60,10 +60,11 @@ namespace Unity.Physics.Authoring
         void OnValidate()
         {
             if (!enabled) return;
+            if (gameObject.scene.isSubScene) return;
             if (m_ConvertedEntity == Entity.Null) return;
 
             // This requires Entity Conversion mode to be 'Convert And Inject Game Object'
-            if (m_ConvertedEntityManager.HasComponent<Physics.PhysicsStep>(m_ConvertedEntity))
+            if (m_ConvertedEntityManager.HasComponent<PhysicsStep>(m_ConvertedEntity))
             {
                 m_ConvertedEntityManager.SetComponentData(m_ConvertedEntity, AsComponent);
             }

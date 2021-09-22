@@ -1,4 +1,4 @@
-﻿using System.Collections.Generic;
+using System.Collections.Generic;
 using Unity.Collections;
 using Unity.Entities;
 using Unity.Mathematics;
@@ -7,10 +7,11 @@ using Unity.Physics.Systems;
 using UnityEditor;
 using UnityEngine;
 
+[UpdateInGroup(typeof(FixedStepSimulationSystemGroup))]
 [UpdateBefore(typeof(BuildPhysicsWorld))]
-public class DebugStream : ComponentSystem
+public class DebugStream : SystemBase
 {
-    List<BlockStream> m_DebugStreams = new List<BlockStream>();
+    readonly List<NativeStream> m_DebugStreams = new List<NativeStream>();
     DrawComponent m_DrawComponent;
     EndFramePhysicsSystem m_EndFramePhysicsSystem;
 
@@ -29,6 +30,45 @@ public class DebugStream : ComponentSystem
         public void End()
         {
             Writer.EndForEachIndex();
+        }
+
+        internal void Point(float3 x, float size, Unity.DebugDisplay.ColorIndex color)
+        {
+            var lines = new Unity.DebugDisplay.Lines(3);
+
+            lines.Draw(x - new float3(size, 0, 0), x + new float3(size, 0, 0), color);
+            lines.Draw(x - new float3(0, size, 0), x + new float3(0, size, 0), color);
+            lines.Draw(x - new float3(0, 0, size), x + new float3(0, 0, size), color);
+        }
+
+        internal void Line(float3 x0, float3 x1, Unity.DebugDisplay.ColorIndex color)
+        {
+            Unity.DebugDisplay.Line.Draw(x0, x1, color);
+        }
+
+        internal void Arrow(float3 x, float3 v, Unity.DebugDisplay.ColorIndex color)
+        {
+            Unity.DebugDisplay.Arrow.Draw(x, v, color);
+        }
+
+        internal void Plane(float3 x, float3 v, Unity.DebugDisplay.ColorIndex color)
+        {
+            Unity.DebugDisplay.Plane.Draw(x, v, color);
+        }
+
+        internal void Arc(float3 center, float3 normal, float3 arm, float angle, Unity.DebugDisplay.ColorIndex color)
+        {
+            Unity.DebugDisplay.Arc.Draw(center, normal, arm, angle, color);
+        }
+
+        internal void Cone(float3 point, float3 axis, float angle, Unity.DebugDisplay.ColorIndex color)
+        {
+            Unity.DebugDisplay.Cone.Draw(point, axis, angle, color);
+        }
+
+        internal void Box(float3 Size, float3 Center, quaternion Orientation, Unity.DebugDisplay.ColorIndex color)
+        {
+            Unity.DebugDisplay.Box.Draw(Size, Center, Orientation, color);
         }
 
         public void Point(float3 x, float size, Color color)
@@ -84,21 +124,20 @@ public class DebugStream : ComponentSystem
             Writer.Write(Type.Text);
             Writer.Write(new Text { X = x, Color = color, Length = text.Length });
 
-            foreach(char c in text)
+            foreach (char c in text)
             {
                 Writer.Write(c);
             }
         }
 
-        internal BlockStream.Writer Writer;
+        internal NativeStream.Writer Writer;
     }
 
     public Context GetContext(int foreachCount)
     {
-        var stream = new BlockStream(foreachCount, 0xcc1922b8);
-
+        var stream = new NativeStream(foreachCount, Allocator.TempJob);
         m_DebugStreams.Add(stream);
-        return new Context { Writer = stream };
+        return new Context { Writer = stream.AsWriter() };
     }
 
     public enum Type
@@ -317,7 +356,7 @@ public class DebugStream : ComponentSystem
         public Color Color;
         public int Length;
 
-        public void Draw(ref BlockStream.Reader reader)
+        public void Draw(ref NativeStream.Reader reader)
         {
             // Read string data.
             char[] stringBuf = new char[Length];
@@ -338,7 +377,7 @@ public class DebugStream : ComponentSystem
     {
         for (int i = 0; i < m_DebugStreams.Count; i++)
         {
-            BlockStream.Reader reader = m_DebugStreams[i];
+            NativeStream.Reader reader = m_DebugStreams[i].AsReader();
             for (int j = 0; j != reader.ForEachCount; j++)
             {
                 reader.BeginForEachIndex(j);
@@ -361,6 +400,10 @@ public class DebugStream : ComponentSystem
                 reader.EndForEachIndex();
             }
         }
+#if UNITY_EDITOR
+        Unity.DebugDisplay.DebugDisplay.Render();
+        Unity.DebugDisplay.DebugDisplay.Clear();
+#endif
     }
 
     private class DrawComponent : MonoBehaviour
@@ -369,11 +412,10 @@ public class DebugStream : ComponentSystem
 
         public void OnDrawGizmos()
         {
-            // Make sure all potential debug display jobs are finished
-            DebugDraw.m_EndFramePhysicsSystem.FinalJobHandle.Complete();
-
             if (DebugDraw != null)
             {
+                // Make sure all potential debug display jobs are finished
+                DebugDraw.m_EndFramePhysicsSystem.GetOutputDependency().Complete();
                 DebugDraw.Draw();
             }
         }
@@ -381,29 +423,69 @@ public class DebugStream : ComponentSystem
 
     protected override void OnUpdate()
     {
-        // Make sure all potential debug display jobs are finished
-        m_EndFramePhysicsSystem.FinalJobHandle.Complete();
-
         // Reset
-        for (int i = 0; i < m_DebugStreams.Count; i++)
-        {
-            m_DebugStreams[i].Dispose();
-        }
-        m_DebugStreams.Clear();
+        ResetDebugStreams();
 
         // Set up component to draw
         if (m_DrawComponent == null)
         {
-            GameObject drawObject = new GameObject();
-            m_DrawComponent = drawObject.AddComponent<DrawComponent>();
-            m_DrawComponent.name = "DebugStream.DrawComponent";
+            m_DrawComponent = new GameObject("DebugStream.DrawComponent", typeof(DrawComponent)){ 
+hideFlags = HideFlags.DontSave }.GetComponent<DrawComponent>();
             m_DrawComponent.DebugDraw = this;
+            Unity.DebugDisplay.DebugDisplay.Instantiate();
         }
     }
 
     protected override void OnDestroy()
     {
+        // Clean up the DrawComponent GameObject.
+        // If we're running the systems outside of PlayMode, we should destroy with DestroyImmediate.
+        if (m_DrawComponent != null)
+        {
+            if (Application.isPlaying)
+                Object.Destroy(m_DrawComponent.gameObject);
+            else
+                Object.DestroyImmediate(m_DrawComponent.gameObject);
+            m_DrawComponent = null;
+        }
+
         for (int i = 0; i < m_DebugStreams.Count; i++)
             m_DebugStreams[i].Dispose();
+        m_DebugStreams.Clear();
+    }
+
+    internal void ResetDebugStreams()
+    {
+        // Make sure all potential debug display jobs are finished
+        m_EndFramePhysicsSystem.GetOutputDependency().Complete();
+
+        for (int i = 0; i < m_DebugStreams.Count; i++)
+        {
+            m_DebugStreams[i].Dispose();
+        }
+        m_DebugStreams.Clear();
+    }
+}
+
+// Workaround to avoid "JobTempAlloc has allocations that are more than 4 frames old - this is not allowed and likely a leak"
+// warnings.
+// The DebugStreams from the previous physics tick are cleared at the beginning of the next tick, in DebugStream.OnUpdate().
+// However, if the fixed timestep is sufficiently large (especially if vsync is disabled), there may be several frames rendered
+// between each pair of physics ticks, causing the temp allocator to believe the memory is much older than it really is and
+// emit a leak warning.
+// As a temporary solution, we'll just clear the streams during the initialization system group, so no allocation lasts longer
+// than a single rendered frame (as originally intended).
+[UpdateInGroup(typeof(InitializationSystemGroup))]
+class DebugStreamClear : SystemBase
+{
+    private DebugStream _debugStreamSys;
+    protected override void OnCreate()
+    {
+        _debugStreamSys = World.GetExistingSystem<DebugStream>();
+    }
+
+    protected override void OnUpdate()
+    {
+        _debugStreamSys.ResetDebugStreams();
     }
 }

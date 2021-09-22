@@ -1,15 +1,10 @@
-using System;
 using Unity.Entities;
 using Unity.Mathematics;
+using Unity.Physics.GraphicsIntegration;
 
 namespace Unity.Physics.Authoring
 {
-    [UpdateAfter(typeof(LegacyBoxColliderConversionSystem))]
-    [UpdateAfter(typeof(LegacyCapsuleColliderConversionSystem))]
-    [UpdateAfter(typeof(LegacySphereColliderConversionSystem))]
-    [UpdateAfter(typeof(LegacyMeshColliderConversionSystem))]
-    [UpdateAfter(typeof(PhysicsShapeConversionSystem))]
-    [UpdateBefore(typeof(LegacyRigidbodyConversionSystem))]
+    [UpdateAfter(typeof(EndColliderConversionSystem))]
     public sealed class PhysicsBodyConversionSystem : GameObjectConversionSystem
     {
         protected override void OnUpdate()
@@ -19,7 +14,7 @@ namespace Unity.Physics.Authoring
                 {
                     var entity = GetPrimaryEntity(staticOptimized.gameObject);
                     if (DstEntityManager.HasComponent<PhysicsCollider>(entity))
-                        DstEntityManager.RemoveParentAndSetWorldTranslationAndRotation(entity, staticOptimized.transform);
+                        DstEntityManager.PostProcessTransformComponents(entity, staticOptimized.transform, BodyMotionType.Static);
                 }
             );
             Entities.ForEach(
@@ -27,7 +22,7 @@ namespace Unity.Physics.Authoring
                 {
                     var entity = GetPrimaryEntity(body.gameObject);
 
-                    DstEntityManager.RemoveParentAndSetWorldTranslationAndRotation(entity, body.transform);
+                    DstEntityManager.PostProcessTransformComponents(entity, body.transform, body.MotionType);
 
                     var customTags = body.CustomTags;
                     if (!customTags.Equals(CustomPhysicsBodyTags.Nothing))
@@ -51,12 +46,13 @@ namespace Unity.Physics.Authoring
                     DstEntityManager.AddOrSetComponent(entity, body.MotionType == BodyMotionType.Dynamic ?
                         PhysicsMass.CreateDynamic(massProperties, body.Mass) :
                         PhysicsMass.CreateKinematic(massProperties));
-                    
-                    DstEntityManager.AddOrSetComponent(entity, new PhysicsVelocity
+
+                    var physicsVelocity = new PhysicsVelocity
                     {
                         Linear = body.InitialLinearVelocity,
                         Angular = body.InitialAngularVelocity
-                    });
+                    };
+                    DstEntityManager.AddOrSetComponent(entity, physicsVelocity);
 
                     if (body.MotionType == BodyMotionType.Dynamic)
                     {
@@ -80,6 +76,19 @@ namespace Unity.Physics.Authoring
                         {
                             Value = 0
                         });
+                    }
+
+                    if (body.Smoothing != BodySmoothing.None)
+                    {
+                        DstEntityManager.AddOrSetComponent(entity, new PhysicsGraphicalSmoothing());
+                        if (body.Smoothing == BodySmoothing.Interpolation)
+                        {
+                            DstEntityManager.AddComponentData(entity, new PhysicsGraphicalInterpolationBuffer
+                            {
+                                PreviousTransform = Math.DecomposeRigidBodyTransform(body.transform.localToWorldMatrix),
+                                PreviousVelocity = physicsVelocity,
+                            });
+                        }
                     }
                 }
             );

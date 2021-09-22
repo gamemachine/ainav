@@ -9,8 +9,9 @@ using UnityEngine;
 namespace Unity.Physics.Authoring
 {
     /// A system to display debug geometry for all body colliders
+    [UpdateInGroup(typeof(FixedStepSimulationSystemGroup))]
     [UpdateAfter(typeof(StepPhysicsWorld))]
-    public class DisplayBodyColliders : ComponentSystem
+    public class DisplayBodyColliders : SystemBase
     {
         BuildPhysicsWorld m_BuildPhysicsWorldSystem;
 
@@ -18,10 +19,9 @@ namespace Unity.Physics.Authoring
         //< system or jobify this system, since we couldn't guarantee the lifetime of the debug
         //< display objects. Caching those objects across frames should allow for improving this
         //< and some reuse of the DebugDraw code.
-        [Obsolete("This type will be made internal in a future release. (RemovedAfter 2019-10-15)")]
-        public unsafe class DrawComponent : MonoBehaviour
+        unsafe class DrawComponent : MonoBehaviour
         {
-            public NativeSlice<RigidBody> Bodies;
+            public NativeArray<RigidBody> Bodies;
             public int NumDynamicBodies;
             public int EnableColliders;
             public int EnableEdges;
@@ -61,6 +61,9 @@ namespace Unity.Physics.Authoring
                 public Vector3 Scale;
                 public Vector3 Position;
                 public Quaternion Orientation;
+
+                [Preserve]
+                public float4x4 Transform => float4x4.TRS(Position, Orientation, Scale);
             }
 
             private static void AppendConvex(ref ConvexHull hull, RigidTransform worldFromCollider, ref List<DisplayResult> results)
@@ -103,10 +106,13 @@ namespace Unity.Physics.Authoring
                     startVertexIndex += hull.Faces[f].NumVertices + 1;
                 }
 
-                UnityEngine.Mesh mesh = new UnityEngine.Mesh();
-                mesh.vertices = vertices;
-                mesh.normals = normals;
-                mesh.triangles = triangles;
+                var mesh = new UnityEngine.Mesh
+                {
+                    hideFlags = HideFlags.HideAndDontSave,
+                    vertices = vertices,
+                    normals = normals,
+                    triangles = triangles
+                };
 
                 results.Add(new DisplayResult
                 {
@@ -200,11 +206,16 @@ namespace Unity.Physics.Authoring
                     }
                 }
 
-                var displayMesh = new UnityEngine.Mesh();
-                displayMesh.indexFormat = vertices.Count > UInt16.MaxValue ? UnityEngine.Rendering.IndexFormat.UInt32 : UnityEngine.Rendering.IndexFormat.UInt16;
-                displayMesh.vertices = vertices.ToArray();
-                displayMesh.normals = normals.ToArray();
-                displayMesh.triangles = triangles.ToArray();
+                var displayMesh = new UnityEngine.Mesh
+                {
+                    hideFlags = HideFlags.HideAndDontSave,
+                    indexFormat = vertices.Count > UInt16.MaxValue
+                        ? UnityEngine.Rendering.IndexFormat.UInt32
+                        : UnityEngine.Rendering.IndexFormat.UInt16
+                };
+                displayMesh.SetVertices(vertices);
+                displayMesh.SetNormals(normals);
+                displayMesh.SetTriangles(triangles, 0);
 
                 results.Add(new DisplayResult
                 {
@@ -229,9 +240,10 @@ namespace Unity.Physics.Authoring
             {
                 ref var terrain = ref terrainCollider->Terrain;
 
-                var vertices = new List<Vector3>();
-                var normals = new List<Vector3>();
-                var triangles = new List<int>();
+                var numVertices = (terrain.Size.x - 1) * (terrain.Size.y - 1) * 6;
+                var vertices = new List<Vector3>(numVertices);
+                var normals = new List<Vector3>(numVertices);
+                var triangles = new List<int>(numVertices);
 
                 int vertexIndex = 0;
                 for (int i = 0; i < terrain.Size.x - 1; i++)
@@ -272,11 +284,16 @@ namespace Unity.Physics.Authoring
                     }
                 }
 
-                var displayMesh = new UnityEngine.Mesh();
-                displayMesh.indexFormat = vertices.Count > UInt16.MaxValue ? UnityEngine.Rendering.IndexFormat.UInt32 : UnityEngine.Rendering.IndexFormat.UInt16;
-                displayMesh.vertices = vertices.ToArray();
-                displayMesh.normals = normals.ToArray();
-                displayMesh.triangles = triangles.ToArray();
+                var displayMesh = new UnityEngine.Mesh
+                {
+                    hideFlags = HideFlags.HideAndDontSave,
+                    indexFormat = vertices.Count > UInt16.MaxValue
+                        ? UnityEngine.Rendering.IndexFormat.UInt32
+                        : UnityEngine.Rendering.IndexFormat.UInt16
+                };
+                displayMesh.SetVertices(vertices);
+                displayMesh.SetNormals(normals);
+                displayMesh.SetTriangles(triangles, 0);
 
                 results.Add(new DisplayResult
                 {
@@ -316,7 +333,10 @@ namespace Unity.Physics.Authoring
                 }
             }
 
-            public static List<DisplayResult> BuildDebugDisplayMesh(Collider* collider)
+            static List<DisplayResult> BuildDebugDisplayMesh(BlobAssetReference<Collider> collider) =>
+                BuildDebugDisplayMesh((Collider*)collider.GetUnsafePtr());
+
+            static List<DisplayResult> BuildDebugDisplayMesh(Collider* collider)
             {
                 List<DisplayResult> results = new List<DisplayResult>();
                 AppendCollider(collider, RigidTransform.identity, ref results);
@@ -331,7 +351,7 @@ namespace Unity.Physics.Authoring
                 to = hullIn.Vertices[toIndex];
             }
 
-            void DrawColliderEdges(ConvexCollider* collider, RigidTransform worldFromConvex, bool drawVertices = false)
+            static void DrawColliderEdges(ConvexCollider* collider, RigidTransform worldFromConvex, bool drawVertices = false)
             {
                 Matrix4x4 originalMatrix = Gizmos.matrix;
                 Color originalColor = Gizmos.color;
@@ -364,7 +384,7 @@ namespace Unity.Physics.Authoring
                             for (int f = 0; f < hull.Faces.Length; f++)
                             {
                                 var face = hull.Faces[f];
-                                for (int v = 0; v < face.NumVertices-1; v++)
+                                for (int v = 0; v < face.NumVertices - 1; v++)
                                 {
                                     byte i = hull.FaceVertexIndices[face.FirstIndex + v];
                                     byte j = hull.FaceVertexIndices[face.FirstIndex + v + 1];
@@ -414,7 +434,7 @@ namespace Unity.Physics.Authoring
                 internal Vector3 B;
             }
 
-            void DrawColliderEdges(MeshCollider* meshCollider, RigidTransform worldFromCollider)
+            static void DrawColliderEdges(MeshCollider* meshCollider, RigidTransform worldFromCollider)
             {
                 Matrix4x4 originalMatrix = Gizmos.matrix;
                 Color originalColor = Gizmos.color;
@@ -487,7 +507,7 @@ namespace Unity.Physics.Authoring
                 Gizmos.matrix = originalMatrix;
             }
 
-            void DrawColliderEdges(CompoundCollider* compoundCollider, RigidTransform worldFromCompound, bool drawVertices = false)
+            static void DrawColliderEdges(CompoundCollider* compoundCollider, RigidTransform worldFromCompound, bool drawVertices = false)
             {
                 for (int i = 0; i < compoundCollider->NumChildren; i++)
                 {
@@ -498,7 +518,7 @@ namespace Unity.Physics.Authoring
                 }
             }
 
-            void DrawColliderEdges(Collider* collider, RigidTransform worldFromCollider, bool drawVertices = false)
+            static void DrawColliderEdges(Collider* collider, RigidTransform worldFromCollider, bool drawVertices = false)
             {
                 switch (collider->CollisionType)
                 {
@@ -519,13 +539,18 @@ namespace Unity.Physics.Authoring
                 }
             }
 
-            public void DrawConnectivity(RigidBody body, bool drawVertices = false)
+            static void DrawColliderEdges(BlobAssetReference<Collider> collider, RigidTransform worldFromCollider, bool drawVertices)
             {
-                if (body.Collider->Type == ColliderType.Convex)
-                    DrawColliderEdges((ConvexCollider*)body.Collider, body.WorldFromBody, drawVertices);
+                DrawColliderEdges((Collider*)collider.GetUnsafePtr(), worldFromCollider, drawVertices);
             }
 
-            public void DrawMeshEdges(RigidBody body) => DrawColliderEdges((MeshCollider*)body.Collider, body.WorldFromBody);
+            public void DrawConnectivity(RigidBody body, bool drawVertices = false)
+            {
+                if (body.Collider.Value.Type == ColliderType.Convex)
+                    DrawColliderEdges((ConvexCollider*)body.Collider.GetUnsafePtr(), body.WorldFromBody, drawVertices);
+            }
+
+            public void DrawMeshEdges(RigidBody body) => DrawColliderEdges((MeshCollider*)body.Collider.GetUnsafePtr(), body.WorldFromBody);
 
             public void OnDrawGizmos()
             {
@@ -534,10 +559,13 @@ namespace Unity.Physics.Authoring
                     return;
                 }
 
+                if (!Bodies.IsCreated)
+                    return;
+
                 for (int b = 0; b < Bodies.Length; b++)
                 {
                     var body = Bodies[b];
-                    if (body.Collider == null)
+                    if (!body.Collider.IsCreated)
                     {
                         continue;
                     }
@@ -566,16 +594,16 @@ namespace Unity.Physics.Authoring
                                 Vector3 position = math.transform(body.WorldFromBody, dr.Position);
                                 Quaternion orientation = math.mul(body.WorldFromBody.rot, dr.Orientation);
                                 Gizmos.DrawMesh(dr.Mesh, position, orientation, dr.Scale);
-                                if (dr.Mesh != CachedReferenceCylinder && dr.Mesh != CachedReferenceSphere)
-                                {
-                                    // Cleanup any meshes that are not our cached ones
-                                    Destroy(dr.Mesh);
-                                }
+                            }
+                            if (dr.Mesh != CachedReferenceCylinder && dr.Mesh != CachedReferenceSphere)
+                            {
+                                // Cleanup any meshes that are not our cached ones
+                                Destroy(dr.Mesh);
                             }
 
                             if (EnableEdges != 0)
                             {
-                                DrawColliderEdges(body.Collider, body.WorldFromBody);
+                                DrawColliderEdges((Collider*)body.Collider.GetUnsafePtr(), body.WorldFromBody);
                             }
                         }
                     }
@@ -589,7 +617,19 @@ namespace Unity.Physics.Authoring
 
         protected override void OnCreate()
         {
+            base.OnCreate();
             m_BuildPhysicsWorldSystem = World.GetOrCreateSystem<BuildPhysicsWorld>();
+        }
+
+        protected override void OnDestroy()
+        {
+            if (m_DrawComponent != null)
+            {
+                m_DrawComponent.Bodies = default;
+            }
+
+            m_BuildPhysicsWorldSystem = null;
+            base.OnDestroy();
         }
 
         protected override void OnUpdate()

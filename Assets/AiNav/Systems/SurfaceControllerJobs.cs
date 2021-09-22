@@ -189,7 +189,7 @@ namespace AiNav
             public void Execute()
             {
                 Dictionary<int2, NavMeshTile> tiles = GCHandle.FromIntPtr(TilesPtr).Target as Dictionary<int2, NavMeshTile>;
-                var store = World.Active.GetExistingSystem<NavMeshStoreSystem>();
+                var store = World.DefaultGameObjectInjectionWorld.GetExistingSystem<NavMeshStoreSystem>();
                 store.SaveTiles(tiles, SurfaceId);
                 TilesSavedStatus[0] = 1;
             }

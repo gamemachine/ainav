@@ -1,41 +1,45 @@
 using System;
+using Unity.Entities;
 using System.ComponentModel;
+using Unity.Assertions;
+using Unity.Burst;
 using Unity.Collections;
+using Unity.Collections.LowLevel.Unsafe;
 using Unity.Mathematics;
 
 namespace Unity.Physics
 {
     // A collection of rigid bodies and joints.
-    public struct PhysicsWorld : ICollidable, IDisposable, ICloneable
+    [NoAlias]
+    public struct PhysicsWorld : ICollidable, IDisposable
     {
-        public CollisionWorld CollisionWorld;   // stores rigid bodies and broadphase
-        public DynamicsWorld DynamicsWorld;     // stores motions and joints
+        [NoAlias] public CollisionWorld CollisionWorld;   // stores rigid bodies and broadphase
+        [NoAlias] public DynamicsWorld DynamicsWorld;     // stores motions and joints
 
         public int NumBodies => CollisionWorld.NumBodies;
-        public int NumDynamicBodies => DynamicsWorld.NumMotions;
-        public int NumStaticBodies => CollisionWorld.NumBodies - DynamicsWorld.NumMotions;
+        public int NumStaticBodies => CollisionWorld.NumStaticBodies;
+        public int NumDynamicBodies => CollisionWorld.NumDynamicBodies;
         public int NumJoints => DynamicsWorld.NumJoints;
 
-        public NativeSlice<RigidBody> Bodies => CollisionWorld.Bodies;
-        public NativeSlice<RigidBody> StaticBodies => new NativeSlice<RigidBody>(CollisionWorld.Bodies, DynamicsWorld.NumMotions, CollisionWorld.NumBodies - DynamicsWorld.NumMotions);
-        public NativeSlice<RigidBody> DynamicBodies => new NativeSlice<RigidBody>(CollisionWorld.Bodies, 0, DynamicsWorld.NumMotions);
-        public NativeSlice<MotionData> MotionDatas => DynamicsWorld.MotionDatas;
-        public NativeSlice<MotionVelocity> MotionVelocities => DynamicsWorld.MotionVelocities;
-        public NativeSlice<Joint> Joints => DynamicsWorld.Joints;
+        public NativeArray<RigidBody> Bodies => CollisionWorld.Bodies;
+        public NativeArray<RigidBody> StaticBodies => CollisionWorld.StaticBodies;
+        public NativeArray<RigidBody> DynamicBodies => CollisionWorld.DynamicBodies;
+        public NativeArray<MotionData> MotionDatas => DynamicsWorld.MotionDatas;
+        public NativeArray<MotionVelocity> MotionVelocities => DynamicsWorld.MotionVelocities;
+        public NativeArray<Joint> Joints => DynamicsWorld.Joints;
 
         // Construct a world with the given number of uninitialized bodies and joints
         public PhysicsWorld(int numStaticBodies, int numDynamicBodies, int numJoints)
         {
-            CollisionWorld = new CollisionWorld(numDynamicBodies + numStaticBodies);
+            CollisionWorld = new CollisionWorld(numStaticBodies, numDynamicBodies);
             DynamicsWorld = new DynamicsWorld(numDynamicBodies, numJoints);
         }
 
         // Reset the number of bodies and joints in the world
         public void Reset(int numStaticBodies, int numDynamicBodies, int numJoints)
         {
-            CollisionWorld.NumBodies = numDynamicBodies + numStaticBodies;
-            DynamicsWorld.NumMotions = numDynamicBodies;
-            DynamicsWorld.NumJoints = numJoints;
+            CollisionWorld.Reset(numStaticBodies, numDynamicBodies);
+            DynamicsWorld.Reset(numDynamicBodies, numJoints);
         }
 
         // Free internal memory
@@ -46,11 +50,24 @@ namespace Unity.Physics
         }
 
         // Clone the world
-        public object Clone() => new PhysicsWorld
+        public PhysicsWorld Clone() => new PhysicsWorld
         {
             CollisionWorld = (CollisionWorld)CollisionWorld.Clone(),
             DynamicsWorld = (DynamicsWorld)DynamicsWorld.Clone()
         };
+
+        public int GetRigidBodyIndex(Entity entity) => CollisionWorld.GetRigidBodyIndex(entity);
+        public int GetJointIndex(Entity entity) => DynamicsWorld.GetJointIndex(entity);
+
+        // NOTE:
+        // The BuildPhysicsWorld system updates the Body and Joint Index Maps.
+        // If the PhysicsWorld is being setup and updated directly then
+        // this UpdateIndexMaps function should be called manually as well.
+        public void UpdateIndexMaps()
+        {
+            CollisionWorld.UpdateBodyIndexMap();
+            DynamicsWorld.UpdateJointIndexMap();
+        }
 
         #region ICollidable implementation
 
@@ -100,12 +117,60 @@ namespace Unity.Physics
             return CollisionWorld.CalculateDistance(input, ref collector);
         }
 
+        #region GO API Queries
+
+        // Interfaces that represent queries that exist in the GameObjects world.
+
+        public bool CheckSphere(float3 position, float radius, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default)
+            => QueryWrappers.CheckSphere(ref this, position, radius, filter, queryInteraction);
+        public bool OverlapSphere(float3 position, float radius, ref NativeList<DistanceHit> outHits, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default)
+            => QueryWrappers.OverlapSphere(ref this, position, radius, ref outHits, filter, queryInteraction);
+        public bool OverlapSphereCustom<T>(float3 position, float radius, ref T collector, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default) where T : struct, ICollector<DistanceHit>
+            => QueryWrappers.OverlapSphereCustom(ref this, position, radius, ref collector, filter, queryInteraction);
+
+        public bool CheckCapsule(float3 point1, float3 point2, float radius, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default)
+            => QueryWrappers.CheckCapsule(ref this, point1, point2, radius, filter, queryInteraction);
+        public bool OverlapCapsule(float3 point1, float3 point2, float radius, ref NativeList<DistanceHit> outHits, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default)
+            => QueryWrappers.OverlapCapsule(ref this, point1, point2, radius, ref outHits, filter, queryInteraction);
+        public bool OverlapCapsuleCustom<T>(float3 point1, float3 point2, float radius, ref T collector, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default) where T : struct, ICollector<DistanceHit>
+            => QueryWrappers.OverlapCapsuleCustom(ref this, point1, point2, radius, ref collector, filter, queryInteraction);
+
+        public bool CheckBox(float3 center, quaternion orientation, float3 halfExtents, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default)
+            => QueryWrappers.CheckBox(ref this, center, orientation, halfExtents, filter, queryInteraction);
+        public bool OverlapBox(float3 center, quaternion orientation, float3 halfExtents, ref NativeList<DistanceHit> outHits, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default)
+            => QueryWrappers.OverlapBox(ref this, center, orientation, halfExtents, ref outHits, filter, queryInteraction);
+        public bool OverlapBoxCustom<T>(float3 center, quaternion orientation, float3 halfExtents, ref T collector, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default) where T : struct, ICollector<DistanceHit>
+            => QueryWrappers.OverlapBoxCustom(ref this, center, orientation, halfExtents, ref collector, filter, queryInteraction);
+
+        public bool SphereCast(float3 origin, float radius, float3 direction, float maxDistance, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default)
+            => QueryWrappers.SphereCast(ref this, origin, radius, direction, maxDistance, filter, queryInteraction);
+        public bool SphereCast(float3 origin, float radius, float3 direction, float maxDistance, out ColliderCastHit hitInfo, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default)
+            => QueryWrappers.SphereCast(ref this, origin, radius, direction, maxDistance, out hitInfo, filter, queryInteraction);
+        public bool SphereCastAll(float3 origin, float radius, float3 direction, float maxDistance, ref NativeList<ColliderCastHit> outHits, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default)
+            => QueryWrappers.SphereCastAll(ref this, origin, radius, direction, maxDistance, ref outHits, filter, queryInteraction);
+        public bool SphereCastCustom<T>(float3 origin, float radius, float3 direction, float maxDistance, ref T collector, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default) where T : struct, ICollector<ColliderCastHit>
+            => QueryWrappers.SphereCastCustom(ref this, origin, radius, direction, maxDistance, ref collector, filter, queryInteraction);
+
+        public bool BoxCast(float3 center, quaternion orientation, float3 halfExtents, float3 direction, float maxDistance, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default)
+            => QueryWrappers.BoxCast(ref this, center, orientation, halfExtents, direction, maxDistance, filter, queryInteraction);
+        public bool BoxCast(float3 center, quaternion orientation, float3 halfExtents, float3 direction, float maxDistance, out ColliderCastHit hitInfo, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default)
+            => QueryWrappers.BoxCast(ref this, center, orientation, halfExtents, direction, maxDistance, out hitInfo, filter, queryInteraction);
+        public bool BoxCastAll(float3 center, quaternion orientation, float3 halfExtents, float3 direction, float maxDistance, ref NativeList<ColliderCastHit> outHits, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default)
+            => QueryWrappers.BoxCastAll(ref this, center, orientation, halfExtents, direction, maxDistance, ref outHits, filter, queryInteraction);
+        public bool BoxCastCustom<T>(float3 center, quaternion orientation, float3 halfExtents, float3 direction, float maxDistance, ref T collector, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default) where T : struct, ICollector<ColliderCastHit>
+            => QueryWrappers.BoxCastCustom(ref this, center, orientation, halfExtents, direction, maxDistance, ref collector, filter, queryInteraction);
+
+        public bool CapsuleCast(float3 point1, float3 point2, float radius, float3 direction, float maxDistance, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default)
+            => QueryWrappers.CapsuleCast(ref this, point1, point2, radius, direction, maxDistance, filter, queryInteraction);
+        public bool CapsuleCast(float3 point1, float3 point2, float radius, float3 direction, float maxDistance, out ColliderCastHit hitInfo, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default)
+            => QueryWrappers.CapsuleCast(ref this, point1, point2, radius, direction, maxDistance, out hitInfo, filter, queryInteraction);
+        public bool CapsuleCastAll(float3 point1, float3 point2, float radius, float3 direction, float maxDistance, ref NativeList<ColliderCastHit> outHits, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default)
+            => QueryWrappers.CapsuleCastAll(ref this, point1, point2, radius, direction, maxDistance, ref outHits, filter, queryInteraction);
+        public bool CapsuleCastCustom<T>(float3 point1, float3 point2, float radius, float3 direction, float maxDistance, ref T collector, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default) where T : struct, ICollector<ColliderCastHit>
+            => QueryWrappers.CapsuleCastCustom(ref this, point1, point2, radius, direction, maxDistance, ref collector, filter, queryInteraction);
+
         #endregion
 
-        #region Obsolete
-        [EditorBrowsable(EditorBrowsableState.Never)]
-        [Obsolete("This property has been deprecated. Get it from CollisionWorld instead. (RemovedAfter 2019-12-09)")]
-        public float CollisionTolerance => CollisionWorld.CollisionTolerance;
         #endregion
     }
 }

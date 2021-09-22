@@ -1,23 +1,32 @@
 {
   "displayName": "Unity Physics",
   "category": "Unity",
-  "description": "Unity's C# stateless physics library. This package is still in experimental phase.",
+  "description": "Unity's C# stateless physics library.\n\nBuilt on top of the Unity C# DOTS framework, Unity Physics is network-ready, completely customizable, and built for performance out of the box. Whether you're building the next mobile hit or a new networked multiplayer console experience, Unity Physics leverages the Burst compiler and Job system to scale across a range of hardware.\n\nUnity Physics is currently in preview, and is compatible with Unity 2019.3 and newer.",
   "dependencies": {
-    "com.unity.burst": "1.1.2",
-    "com.unity.entities": "0.1.1-preview",
-    "com.unity.test-framework.performance": "1.0.9-preview"
+    "com.unity.burst": "1.4.1",
+    "com.unity.collections": "0.15.0-preview.21",
+    "com.unity.entities": "0.17.0-preview.41",
+    "com.unity.jobs": "0.8.0-preview.23",
+    "com.unity.mathematics": "1.2.1",
+    "com.unity.test-framework": "1.1.11",
+    "com.unity.test-framework.performance": "2.3.1-preview",
+    "com.unity.modules.imgui": "1.0.0",
+    "com.unity.modules.jsonserialize": "1.0.0"
   },
   "keywords": [
     "unity",
     "physics"
   ],
   "name": "com.unity.physics",
-  "unity": "2019.1",
-  "unityRelease": "10f1",
-  "version": "0.2.4-preview",
+  "unity": "2020.1",
+  "unityRelease": "9f1",
+  "version": "0.6.0-preview.3",
+  "upmCi": {
+    "footprint": "41505f878ca975ba8f05c9c340e130919ba38f4f"
+  },
   "repository": {
+    "url": "https://github.com/Unity-Technologies/Unity.Physics.git",
     "type": "git",
-    "url": "git@github.com:Unity-Technologies/Unity.Physics.git",
-    "revision": "ce0179b7dc93da3591848c0a5eec740d5b394f95"
+    "revision": "6ec1fba588df68052879913d6e4b14ed3714e90e"
   }
 }

@@ -20,9 +20,9 @@ namespace Unity.Physics
         // If the value in both objects is equal and negative, the objects never collide.
         public int GroupIndex;
 
-        // Return false if the filter cannot collide with anything,
+        // Returns true if the filter cannot collide with anything,
         // which likely means it was default constructed but not initialized.
-        public bool IsValid => BelongsTo > 0 && CollidesWith > 0;
+        public bool IsEmpty => BelongsTo == 0 || CollidesWith == 0;
 
         // A collision filter which wants to collide with everything.
         public static readonly CollisionFilter Default = new CollisionFilter

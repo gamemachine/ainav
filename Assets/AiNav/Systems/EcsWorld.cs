@@ -32,7 +32,7 @@ namespace AiNav
                     return GetEditorModeWorld();
                 }
 #endif
-                return World.Active;
+                return World.DefaultGameObjectInjectionWorld;
             }
         }
 
@@ -40,21 +40,21 @@ namespace AiNav
         public static void StopEditorSystems()
         {
             if (UnityEditor.EditorApplication.isPlaying) return;
-            if (World.Active == null) return;
+            if (World.DefaultGameObjectInjectionWorld == null) return;
             if (!EditorModeEnabled) return;
 
             foreach (var config in SystemConfigs)
             {
-                var system = World.Active.GetExistingSystem(config.Type);
+                var system = World.DefaultGameObjectInjectionWorld.GetExistingSystem(config.Type);
                 if (config.Update)
                 {
                     UnityEditor.EditorApplication.update -= system.Update;
                 }
-                World.Active.DestroySystem(system);
+                World.DefaultGameObjectInjectionWorld.DestroySystem(system);
             }
 
-            var entities = World.Active.EntityManager.GetAllEntities(Allocator.Temp);
-            World.Active.EntityManager.DestroyEntity(entities);
+            var entities = World.DefaultGameObjectInjectionWorld.EntityManager.GetAllEntities(Allocator.Temp);
+            World.DefaultGameObjectInjectionWorld.EntityManager.DestroyEntity(entities);
             entities.Dispose();
 
             EditorModeEnabled = false;
@@ -63,7 +63,7 @@ namespace AiNav
 
         private static World GetEditorModeWorld()
         {
-            if (World.Active == null)
+            if (World.DefaultGameObjectInjectionWorld == null)
             {
                 DefaultWorldInitialization.DefaultLazyEditModeInitialize();
             }
@@ -74,7 +74,7 @@ namespace AiNav
 
                 foreach (var config in SystemConfigs)
                 {
-                    var system = World.Active.GetOrCreateSystem(config.Type);
+                    var system = World.DefaultGameObjectInjectionWorld.GetOrCreateSystem(config.Type);
                     
                     if (config.Update)
                     {
@@ -86,7 +86,7 @@ namespace AiNav
                 Debug.Log("Editor systems started");
             }
             
-            return World.Active;
+            return World.DefaultGameObjectInjectionWorld;
         }
 
         private static void OnPlaymodeChanged(UnityEditor.PlayModeStateChange change)

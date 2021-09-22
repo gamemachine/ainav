@@ -1,14 +1,160 @@
 using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
+using Unity.Entities;
 using Unity.Mathematics;
 
-namespace Unity.Physics.LowLevel
+namespace Unity.Physics
 {
     // An event raised when a pair of bodies have collided during solving.
-    struct CollisionEvent
+    public struct CollisionEvent
+    {
+        internal CollisionEventDataRef EventData;
+        internal float TimeStep;
+        internal Velocity InputVelocityA;
+        internal Velocity InputVelocityB;
+
+        public Entity EntityB => EventData.Value.Entities.EntityB;
+        public Entity EntityA => EventData.Value.Entities.EntityA;
+        public int BodyIndexB => EventData.Value.BodyIndices.BodyIndexB;
+        public int BodyIndexA => EventData.Value.BodyIndices.BodyIndexA;
+        public ColliderKey ColliderKeyB => EventData.Value.ColliderKeys.ColliderKeyB;
+        public ColliderKey ColliderKeyA => EventData.Value.ColliderKeys.ColliderKeyA;
+
+        public float3 Normal => EventData.Value.Normal;
+
+        // Calculate extra details about the collision.
+        // Note: Since the solver does not naturally produce this data, it requires some computation.
+        public Details CalculateDetails(ref PhysicsWorld physicsWorld)
+        {
+            int numContactPoints = EventData.Value.NumNarrowPhaseContactPoints;
+            var contactPoints = new NativeArray<ContactPoint>(numContactPoints, Allocator.Temp);
+            for (int i = 0; i < numContactPoints; i++)
+            {
+                contactPoints[i] = EventData.Value.AccessContactPoint(i);
+            }
+
+            return EventData.Value.CalculateDetails(ref physicsWorld, TimeStep, InputVelocityA, InputVelocityB, contactPoints);
+        }
+
+        // Extra details about a collision
+        public struct Details
+        {
+            // Estimated contact point positions (in world space).
+            // Use this information about individual contact point positions
+            // to apply custom logic, for example looking at the Length
+            // to differentiate between vertex (1 point), edge (2 point)
+            // or face (3 or more points) collision.
+            public NativeArray<float3> EstimatedContactPointPositions;
+
+            // Estimated total impulse applied
+            public float EstimatedImpulse;
+
+            // Calculate the average contact point position
+            public float3 AverageContactPointPosition
+            {
+                get
+                {
+                    var pos = float3.zero;
+                    for (int i = 0; i < EstimatedContactPointPositions.Length; i++)
+                    {
+                        pos += EstimatedContactPointPositions[i];
+                    }
+                    return pos / EstimatedContactPointPositions.Length;
+                }
+            }
+        }
+    }
+
+    // A stream of collision events.
+    // This is a value type, which means it can be used in Burst jobs (unlike IEnumerable<CollisionEvent>).
+    public struct CollisionEvents /* : IEnumerable<CollisionEvent> */
+    {
+        //@TODO: Unity should have a Allow null safety restriction
+        [NativeDisableContainerSafetyRestriction]
+        private readonly NativeStream m_EventDataStream;
+
+        private readonly NativeArray<Velocity> m_InputVelocities;
+        private readonly float m_TimeStep;
+
+        internal CollisionEvents(NativeStream eventDataStream, NativeArray<Velocity> inputVelocities, float timeStep)
+        {
+            m_EventDataStream = eventDataStream;
+            m_InputVelocities = inputVelocities;
+            m_TimeStep = timeStep;
+        }
+
+        public Enumerator GetEnumerator()
+        {
+            return new Enumerator(m_EventDataStream, m_InputVelocities, m_TimeStep);
+        }
+
+        public struct Enumerator /* : IEnumerator<CollisionEvent> */
+        {
+            private NativeStream.Reader m_Reader;
+            private int m_CurrentWorkItem;
+            private readonly int m_NumWorkItems;
+            private CollisionEventDataRef m_Current;
+
+            private readonly NativeArray<Velocity> m_InputVelocities;
+            private readonly float m_TimeStep;
+
+            public CollisionEvent Current
+            {
+                get => m_Current.Value.CreateCollisionEvent(m_TimeStep, m_InputVelocities);
+            }
+
+            internal Enumerator(NativeStream stream, NativeArray<Velocity> inputVelocities, float timeStep)
+            {
+                m_Reader = stream.IsCreated ? stream.AsReader() : new NativeStream.Reader();
+                m_CurrentWorkItem = 0;
+                m_NumWorkItems = stream.IsCreated ? stream.ForEachCount : 0;
+
+                m_InputVelocities = inputVelocities;
+                m_TimeStep = timeStep;
+
+                unsafe
+                {
+                    m_Current = default;
+                }
+
+                AdvanceReader();
+            }
+
+            public bool MoveNext()
+            {
+                if (m_Reader.RemainingItemCount > 0)
+                {
+                    int currentSize = m_Reader.Read<int>();
+                    AdvanceReader();
+
+                    unsafe
+                    {
+                        m_Current = new CollisionEventDataRef((CollisionEventData*)(m_Reader.ReadUnsafePtr(currentSize)));
+                    }
+
+                    AdvanceReader();
+                    return true;
+                }
+                return false;
+            }
+
+            private void AdvanceReader()
+            {
+                while (m_Reader.RemainingItemCount == 0 && m_CurrentWorkItem < m_NumWorkItems)
+                {
+                    m_Reader.BeginForEachIndex(m_CurrentWorkItem);
+                    m_CurrentWorkItem++;
+                }
+            }
+        }
+    }
+
+    // An event raised when a pair of bodies have collided during solving.
+    struct CollisionEventData
     {
         public BodyIndexPair BodyIndices;
         public ColliderKeyPair ColliderKeys;
+        public EntityPair Entities;
         public float3 Normal;
 
         // The total impulse applied by the solver for this pair
@@ -17,31 +163,44 @@ namespace Unity.Physics.LowLevel
         // Number of narrow phase contact points
         internal int NumNarrowPhaseContactPoints;
 
+        internal unsafe CollisionEvent CreateCollisionEvent(float timeStep, NativeArray<Velocity> inputVelocities)
+        {
+            int bodyIndexA = BodyIndices.BodyIndexA;
+            int bodyIndexB = BodyIndices.BodyIndexB;
+            return new CollisionEvent
+            {
+                EventData = new CollisionEventDataRef((CollisionEventData*)(UnsafeUtility.AddressOf(ref this))),
+                TimeStep = timeStep,
+                InputVelocityA = bodyIndexA < inputVelocities.Length ? inputVelocities[bodyIndexA] : Velocity.Zero,
+                InputVelocityB = bodyIndexB < inputVelocities.Length ? inputVelocities[bodyIndexB] : Velocity.Zero
+            };
+        }
+
         internal static int CalculateSize(int numContactPoints)
         {
-            return UnsafeUtility.SizeOf<CollisionEvent>() + numContactPoints * UnsafeUtility.SizeOf<ContactPoint>();
+            return UnsafeUtility.SizeOf<CollisionEventData>() + numContactPoints * UnsafeUtility.SizeOf<ContactPoint>();
         }
 
         internal unsafe ref ContactPoint AccessContactPoint(int pointIndex)
         {
             byte* ptr = (byte*)UnsafeUtility.AddressOf(ref this);
-            ptr += UnsafeUtility.SizeOf<CollisionEvent>() + pointIndex * UnsafeUtility.SizeOf<ContactPoint>();
-            return ref UnsafeUtilityEx.AsRef<ContactPoint>(ptr);
+            ptr += UnsafeUtility.SizeOf<CollisionEventData>() + pointIndex * UnsafeUtility.SizeOf<ContactPoint>();
+            return ref UnsafeUtility.AsRef<ContactPoint>(ptr);
         }
 
         // Calculate extra details about the collision, by re-integrating the leaf colliders to the time of collision
-        internal unsafe Physics.CollisionEvent.Details CalculateDetails(
+        internal unsafe CollisionEvent.Details CalculateDetails(
             ref PhysicsWorld physicsWorld, float timeStep, Velocity inputVelocityA, Velocity inputVelocityB, NativeArray<ContactPoint> narrowPhaseContactPoints)
         {
-            int bodyAIndex = BodyIndices.BodyAIndex;
-            int bodyBIndex = BodyIndices.BodyBIndex;
-            bool bodyAIsDynamic = bodyAIndex < physicsWorld.MotionVelocities.Length;
-            bool bodyBIsDynamic = bodyBIndex < physicsWorld.MotionVelocities.Length;
+            int bodyIndexA = BodyIndices.BodyIndexA;
+            int bodyIndexB = BodyIndices.BodyIndexB;
+            bool bodyAIsDynamic = bodyIndexA < physicsWorld.MotionVelocities.Length;
+            bool bodyBIsDynamic = bodyIndexB < physicsWorld.MotionVelocities.Length;
 
-            MotionVelocity motionVelocityA = bodyAIsDynamic ? physicsWorld.MotionVelocities[bodyAIndex] : MotionVelocity.Zero;
-            MotionVelocity motionVelocityB = bodyBIsDynamic ? physicsWorld.MotionVelocities[bodyBIndex] : MotionVelocity.Zero;
-            MotionData motionDataA = bodyAIsDynamic ? physicsWorld.MotionDatas[bodyAIndex] : MotionData.Zero;
-            MotionData motionDataB = bodyBIsDynamic ? physicsWorld.MotionDatas[bodyBIndex] : MotionData.Zero;
+            MotionVelocity motionVelocityA = bodyAIsDynamic ? physicsWorld.MotionVelocities[bodyIndexA] : MotionVelocity.Zero;
+            MotionVelocity motionVelocityB = bodyBIsDynamic ? physicsWorld.MotionVelocities[bodyIndexB] : MotionVelocity.Zero;
+            MotionData motionDataA = bodyAIsDynamic ? physicsWorld.MotionDatas[bodyIndexA] : MotionData.Zero;
+            MotionData motionDataB = bodyBIsDynamic ? physicsWorld.MotionDatas[bodyIndexB] : MotionData.Zero;
 
             float estimatedImpulse = SolverImpulse;
 
@@ -90,12 +249,14 @@ namespace Unity.Physics.LowLevel
 
                 if (numRemainingVelocities > 0.0f)
                 {
-                    float sumInvMass = motionVelocityA.InverseInertiaAndMass.w + motionVelocityB.InverseInertiaAndMass.w;
+                    float sumInvMass = motionVelocityA.InverseMass + motionVelocityB.InverseMass;
                     estimatedImpulse += sumRemainingVelocities / (numRemainingVelocities * sumInvMass);
                 }
             }
 
             // Then, sub-integrate for time of impact and keep contact points closer than hitDistanceThreshold
+            int closestContactIndex = -1;
+            float minDistance = float.MaxValue;
             {
                 int estimatedContactPointCount = 0;
                 for (int i = 0; i < narrowPhaseContactPoints.Length; i++)
@@ -108,25 +269,45 @@ namespace Unity.Physics.LowLevel
                         float3 relVel = pointVelB - pointVelA;
                         float projRelVel = math.dot(relVel, Normal);
 
-                        // Position the point on body A
-                        cp.Position += Normal * cp.Distance;
+                        // Only sub integrate if approaching, otherwise leave it as is
+                        // (it can happen that input velocity was separating but there
+                        // still was a collision event - penetration recovery, or other
+                        // body pushing in different direction).
+                        if (projRelVel > 0.0f)
+                        {
+                            // Position the point on body A
+                            cp.Position += Normal * cp.Distance;
 
-                        // Sub integrate the point
-                        cp.Position -= relVel * toi;
+                            // Sub integrate the point
+                            cp.Position -= relVel * toi;
 
-                        // Reduce the distance
-                        cp.Distance -= projRelVel * toi;
+                            // Reduce the distance
+                            cp.Distance -= projRelVel * toi;
+                        }
 
                         // Filter out contacts that are still too far away
                         if (cp.Distance <= physicsWorld.CollisionWorld.CollisionTolerance)
                         {
                             narrowPhaseContactPoints[estimatedContactPointCount++] = cp;
                         }
+                        else if (cp.Distance < minDistance)
+                        {
+                            minDistance = cp.Distance;
+                            closestContactIndex = i;
+                        }
                     }
                 }
 
+                // If due to estimation of relative velocity no contact points will
+                // get closer than the tolerance, we need to export the closest one
+                // to make sure at least one contact point is reported.
+                if (estimatedContactPointCount == 0)
+                {
+                    narrowPhaseContactPoints[estimatedContactPointCount++] = narrowPhaseContactPoints[closestContactIndex];
+                }
+
                 // Instantiate collision details and allocate memory
-                var details = new Physics.CollisionEvent.Details
+                var details = new CollisionEvent.Details
                 {
                     EstimatedContactPointPositions = new NativeArray<float3>(estimatedContactPointCount, Allocator.Temp),
                     EstimatedImpulse = estimatedImpulse
@@ -150,82 +331,17 @@ namespace Unity.Physics.LowLevel
         }
     }
 
-    // A stream of collision events.
-    // This is a value type, which means it can be used in Burst jobs (unlike IEnumerable<CollisionEvent>).
-    struct CollisionEvents /* : IEnumerable<CollisionEvent> */
+    // Wraps a pointer to CollisionEventData.
+    // Used in enumerator for collision events.
+    struct CollisionEventDataRef
     {
-        //@TODO: Unity should have a Allow null safety restriction
-        [NativeDisableContainerSafetyRestriction]
-        private readonly BlockStream m_EventStream;
+        private unsafe CollisionEventData* m_CollisionEventData;
 
-        public CollisionEvents(BlockStream eventStream)
+        public unsafe CollisionEventDataRef(CollisionEventData* collisionEventData)
         {
-            m_EventStream = eventStream;
+            m_CollisionEventData = collisionEventData;
         }
 
-        public Enumerator GetEnumerator()
-        {
-            return new Enumerator(m_EventStream);
-        }
-
-        public struct Enumerator /* : IEnumerator<CollisionEvent> */
-        {
-            private BlockStream.Reader m_Reader;
-            private int m_CurrentWorkItem;
-            private readonly int m_NumWorkItems;
-            private unsafe CollisionEvent* m_Current;
-            
-            public ref CollisionEvent Current
-            {
-                get
-                {
-                    unsafe
-                    {
-                        return ref UnsafeUtilityEx.AsRef<CollisionEvent>(m_Current);
-                    }
-                }
-            }
-
-            public Enumerator(BlockStream stream)
-            {
-                m_Reader = stream.IsCreated ? stream : new BlockStream.Reader();
-                m_CurrentWorkItem = 0;
-                m_NumWorkItems = stream.IsCreated ? stream.ForEachCount : 0;
-
-                unsafe
-                {
-                    m_Current = default;
-                }
-
-                AdvanceReader();
-            }
-
-            public bool MoveNext()
-            {
-                if (m_Reader.RemainingItemCount > 0)
-                {
-                    int currentSize = m_Reader.Read<int>();
-                    AdvanceReader();
-
-                    unsafe
-                    {
-                        m_Current = (CollisionEvent*)m_Reader.Read(currentSize);
-                    }
-
-                    AdvanceReader();
-                    return true;
-                }
-                return false;
-            }
-
-            private void AdvanceReader()
-            {
-                while (m_Reader.RemainingItemCount == 0 && m_CurrentWorkItem < m_NumWorkItems)
-                {
-                    m_Reader.BeginForEachIndex(m_CurrentWorkItem);
-                    m_CurrentWorkItem++;
-                }
-            }
-        }
+        public unsafe ref CollisionEventData Value => ref UnsafeUtility.AsRef<CollisionEventData>(m_CollisionEventData);
     }
 }

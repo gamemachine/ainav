@@ -1,10 +1,10 @@
 ﻿using System;
-using UnityEngine;
+using Unity.Mathematics;
 
 namespace Unity.Physics.Authoring
 {
     [Serializable]
-    public struct PhysicsCategoryTags
+    public struct PhysicsCategoryTags : IEquatable<PhysicsCategoryTags>
     {
         public static PhysicsCategoryTags Everything => new PhysicsCategoryTags { Value = unchecked((uint)~0) };
         public static PhysicsCategoryTags Nothing => new PhysicsCategoryTags { Value = 0 };
@@ -46,6 +46,7 @@ namespace Unity.Physics.Authoring
         {
             get
             {
+                SafetyChecks.CheckInRangeAndThrow(i, new int2(0, 31), nameof(i));
                 switch (i)
                 {
                     case  0: return Category00;
@@ -80,11 +81,12 @@ namespace Unity.Physics.Authoring
                     case 29: return Category29;
                     case 30: return Category30;
                     case 31: return Category31;
-                    default: throw new ArgumentOutOfRangeException();
+                    default: return default;
                 }
             }
             set
             {
+                SafetyChecks.CheckInRangeAndThrow(i, new int2(0, 31), nameof(i));
                 switch (i)
                 {
                     case  0: Category00 = value; break;
@@ -119,7 +121,6 @@ namespace Unity.Physics.Authoring
                     case 29: Category29 = value; break;
                     case 30: Category30 = value; break;
                     case 31: Category31 = value; break;
-                    default: throw new ArgumentOutOfRangeException();
                 }
             }
         }
@@ -199,5 +200,11 @@ namespace Unity.Physics.Authoring
                 Category31 = (value & (1 << 31)) != 0;
             }
         }
+
+        public bool Equals(PhysicsCategoryTags other) => Value == other.Value;
+
+        public override bool Equals(object obj) => obj is PhysicsCategoryTags other && Equals(other);
+
+        public override int GetHashCode() => unchecked((int)Value);
     }
 }

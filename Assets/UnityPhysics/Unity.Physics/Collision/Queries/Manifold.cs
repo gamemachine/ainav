@@ -1,5 +1,7 @@
 using System;
+using Unity.Burst;
 using Unity.Collections;
+using Unity.Collections.LowLevel.Unsafe;
 using Unity.Mathematics;
 using static Unity.Physics.Math;
 
@@ -23,7 +25,7 @@ namespace Unity.Physics
     // A contact point in a manifold. All contacts share the same normal.
     public struct ContactPoint
     {
-        public float3 Position; // world space position on object A
+        public float3 Position; // world space position on object B
         public float Distance;  // separating distance along the manifold normal
     }
 
@@ -31,19 +33,20 @@ namespace Unity.Physics
     static class ManifoldQueries
     {
         // A context passed through the manifold generation functions
-        internal struct Context
+        internal unsafe struct Context
         {
             public BodyIndexPair BodyIndices;
             public CustomTagsPair BodyCustomTags;
             public bool BodiesHaveInfiniteMass;
+            public NativeStream.Writer* ContactWriter;  // cannot be passed by value
         }
 
         // Write a set of contact manifolds for a pair of bodies to the given stream.
-        public static unsafe void BodyBody(RigidBody rigidBodyA, RigidBody rigidBodyB, MotionVelocity motionVelocityA, MotionVelocity motionVelocityB,
-            float collisionTolerance, float timeStep, BodyIndexPair pair, ref BlockStream.Writer contactWriter)
+        public static unsafe void BodyBody(in RigidBody rigidBodyA, in RigidBody rigidBodyB, in MotionVelocity motionVelocityA, in MotionVelocity motionVelocityB,
+            float collisionTolerance, float timeStep, BodyIndexPair pair, ref NativeStream.Writer contactWriter)
         {
-            Collider* colliderA = rigidBodyA.Collider;
-            Collider* colliderB = rigidBodyB.Collider;
+            var colliderA = (Collider*)rigidBodyA.Collider.GetUnsafePtr();
+            var colliderB = (Collider*)rigidBodyB.Collider.GetUnsafePtr();
 
             if (colliderA == null || colliderB == null || !CollisionFilter.IsCollisionEnabled(colliderA->Filter, colliderB->Filter))
             {
@@ -66,9 +69,8 @@ namespace Unity.Physics
             {
                 BodyIndices = pair,
                 BodyCustomTags = new CustomTagsPair { CustomTagsA = rigidBodyA.CustomTags, CustomTagsB = rigidBodyB.CustomTags },
-                BodiesHaveInfiniteMass =
-                    !math.any(motionVelocityA.InverseInertiaAndMass) &&
-                    !math.any(motionVelocityB.InverseInertiaAndMass)
+                BodiesHaveInfiniteMass = motionVelocityA.HasInfiniteInertiaAndMass && motionVelocityB.HasInfiniteInertiaAndMass,
+                ContactWriter = (NativeStream.Writer*)UnsafeUtility.AddressOf(ref contactWriter)
             };
 
             var worldFromA = new MTransform(rigidBodyA.WorldFromBody);
@@ -81,13 +83,13 @@ namespace Unity.Physics
                     switch (colliderB->CollisionType)
                     {
                         case CollisionType.Convex:
-                            ConvexConvex(context, ColliderKeyPair.Empty, colliderA, colliderB, worldFromA, worldFromB, expansion.MaxDistance, false, ref contactWriter);
+                            ConvexConvex(context, ColliderKeyPair.Empty, colliderA, colliderB, worldFromA, worldFromB, expansion.MaxDistance, false);
                             break;
                         case CollisionType.Composite:
-                            ConvexComposite(context, ColliderKey.Empty, colliderA, colliderB, worldFromA, worldFromB, expansion, false, ref contactWriter);
+                            ConvexComposite(context, ColliderKey.Empty, colliderA, colliderB, worldFromA, worldFromB, expansion, false);
                             break;
                         case CollisionType.Terrain:
-                            ConvexTerrain(context, ColliderKeyPair.Empty, colliderA, colliderB, worldFromA, worldFromB, expansion.MaxDistance, false, ref contactWriter);
+                            ConvexTerrain(context, ColliderKeyPair.Empty, colliderA, colliderB, worldFromA, worldFromB, expansion.MaxDistance, false);
                             break;
                     }
                     break;
@@ -95,13 +97,13 @@ namespace Unity.Physics
                     switch (colliderB->CollisionType)
                     {
                         case CollisionType.Convex:
-                            CompositeConvex(context, colliderA, colliderB, worldFromA, worldFromB, expansion, false, ref contactWriter);
+                            CompositeConvex(context, colliderA, colliderB, worldFromA, worldFromB, expansion, false);
                             break;
                         case CollisionType.Composite:
-                            CompositeComposite(context, colliderA, colliderB, worldFromA, worldFromB, expansion, false, ref contactWriter);
+                            CompositeComposite(context, colliderA, colliderB, worldFromA, worldFromB, expansion, false);
                             break;
                         case CollisionType.Terrain:
-                            CompositeTerrain(context, colliderA, colliderB, worldFromA, worldFromB, expansion.MaxDistance, false, ref contactWriter);
+                            CompositeTerrain(context, colliderA, colliderB, worldFromA, worldFromB, expansion.MaxDistance, false);
                             break;
                     }
                     break;
@@ -109,10 +111,10 @@ namespace Unity.Physics
                     switch (colliderB->CollisionType)
                     {
                         case CollisionType.Convex:
-                            TerrainConvex(context, ColliderKeyPair.Empty, colliderA, colliderB, worldFromA, worldFromB, expansion.MaxDistance, false, ref contactWriter);
+                            TerrainConvex(context, ColliderKeyPair.Empty, colliderA, colliderB, worldFromA, worldFromB, expansion.MaxDistance, false);
                             break;
                         case CollisionType.Composite:
-                            TerrainComposite(context, colliderA, colliderB, worldFromA, worldFromB, expansion.MaxDistance, false, ref contactWriter);
+                            TerrainComposite(context, colliderA, colliderB, worldFromA, worldFromB, expansion.MaxDistance, false);
                             break;
                         case CollisionType.Terrain:
                             UnityEngine.Assertions.Assert.IsTrue(false);
@@ -122,8 +124,8 @@ namespace Unity.Physics
             }
         }
 
-        private static void WriteManifold(ConvexConvexManifoldQueries.Manifold manifold, Context context, ColliderKeyPair colliderKeys,
-            Material materialA, Material materialB, bool flipped, ref BlockStream.Writer contactWriter)
+        private static unsafe void WriteManifold(ConvexConvexManifoldQueries.Manifold manifold, Context context, ColliderKeyPair colliderKeys,
+            Material materialA, Material materialB, bool flipped)
         {
             // Write results to stream
             if (manifold.NumContacts > 0)
@@ -144,17 +146,23 @@ namespace Unity.Physics
 
                 // Apply materials
                 {
-                    Material.MaterialFlags combinedFlags = materialA.Flags | materialB.Flags;
-                    if ((combinedFlags & Material.MaterialFlags.IsTrigger) != 0)
+                    // Combined collision response of the two
+                    CollisionResponsePolicy combinedCollisionResponse = Material.GetCombinedCollisionResponse(materialA, materialB);
+                    Unity.Assertions.Assert.IsFalse(combinedCollisionResponse == CollisionResponsePolicy.None,
+                        "DisableCollisions pairs should have been filtered out earlier!");
+
+                    if (combinedCollisionResponse == CollisionResponsePolicy.RaiseTriggerEvents)
                     {
                         header.JacobianFlags |= JacobianFlags.IsTrigger;
                     }
                     else
                     {
-                        if ((combinedFlags & Material.MaterialFlags.EnableCollisionEvents) != 0)
+                        if (combinedCollisionResponse == CollisionResponsePolicy.CollideRaiseCollisionEvents)
                         {
                             header.JacobianFlags |= JacobianFlags.EnableCollisionEvents;
                         }
+
+                        Material.MaterialFlags combinedFlags = materialA.Flags | materialB.Flags;
                         if ((combinedFlags & Material.MaterialFlags.EnableMassFactors) != 0)
                         {
                             header.JacobianFlags |= JacobianFlags.EnableMassFactors;
@@ -169,7 +177,7 @@ namespace Unity.Physics
                     }
                 }
 
-                contactWriter.Write(header);
+                context.ContactWriter->Write(header);
 
                 // Group the contact points in 2s (when 4-6 contact points) and 3s (6 or more contact points)
                 // to avoid the order forcing the magnitude of the impulse on one side of the face.
@@ -177,7 +185,9 @@ namespace Unity.Physics
                 int startIndex = 0;
                 int increment = header.NumContacts < 6 ?
                     math.max(header.NumContacts / 2, 1) : (header.NumContacts / 3 + ((header.NumContacts % 3 > 0) ? 1 : 0));
-                for (int contactIndex = 0; ; contactIndex += increment)
+
+                int contactIndex = 0;
+                while (true)
                 {
                     if (contactIndex >= header.NumContacts)
                     {
@@ -188,25 +198,34 @@ namespace Unity.Physics
                         }
                         contactIndex = startIndex;
                     }
-
-                    contactWriter.Write(manifold[contactIndex]);
+                    context.ContactWriter->Write(manifold[contactIndex]);
+                    contactIndex += increment;
                 }
             }
         }
 
         private static unsafe void ConvexConvex(
             Context context, ColliderKeyPair colliderKeys,
-            Collider* convexColliderA, Collider* convexColliderB, MTransform worldFromA, MTransform worldFromB,
-            float maxDistance, bool flipped, ref BlockStream.Writer contactWriter)
+            Collider* convexColliderA, Collider* convexColliderB, [NoAlias] in MTransform worldFromA, [NoAlias] in MTransform worldFromB,
+            float maxDistance, bool flipped)
         {
             Material materialA = ((ConvexColliderHeader*)convexColliderA)->Material;
             Material materialB = ((ConvexColliderHeader*)convexColliderB)->Material;
+
+            CollisionResponsePolicy combinedCollisionResponse = Material.GetCombinedCollisionResponse(materialA, materialB);
+
+            // Skip the shapes if any of them is marked with a "None" collision response
+            if (combinedCollisionResponse == CollisionResponsePolicy.None)
+            {
+                return;
+            }
 
             // Skip if the bodies have infinite mass and the materials don't want to raise any solver events,
             // since the resulting contacts can't have any effect during solving
             if (context.BodiesHaveInfiniteMass)
             {
-                if (((materialA.Flags | materialB.Flags) & (Material.MaterialFlags.IsTrigger | Material.MaterialFlags.EnableCollisionEvents)) == 0)
+                if (combinedCollisionResponse != CollisionResponsePolicy.RaiseTriggerEvents &&
+                    combinedCollisionResponse != CollisionResponsePolicy.CollideRaiseCollisionEvents)
                 {
                     return;
                 }
@@ -251,7 +270,8 @@ namespace Unity.Physics
                                 worldFromA, aFromB, maxDistance, out contactManifold);
                             break;
                         default:
-                            throw new NotImplementedException();
+                            SafetyChecks.ThrowNotImplementedException();
+                            return;
                     }
                     break;
                 case ColliderType.Box:
@@ -281,7 +301,8 @@ namespace Unity.Physics
                                 worldFromA, aFromB, maxDistance, out contactManifold);
                             break;
                         default:
-                            throw new NotImplementedException();
+                            SafetyChecks.ThrowNotImplementedException();
+                            return;
                     }
                     break;
                 case ColliderType.Capsule:
@@ -311,7 +332,8 @@ namespace Unity.Physics
                                 worldFromA, aFromB, maxDistance, out contactManifold);
                             break;
                         default:
-                            throw new NotImplementedException();
+                            SafetyChecks.ThrowNotImplementedException();
+                            return;
                     }
                     break;
                 case ColliderType.Triangle:
@@ -343,7 +365,8 @@ namespace Unity.Physics
                                 worldFromA, aFromB, maxDistance, out contactManifold);
                             break;
                         default:
-                            throw new NotImplementedException();
+                            SafetyChecks.ThrowNotImplementedException();
+                            return;
                     }
                     break;
                 case ColliderType.Quad:
@@ -354,17 +377,26 @@ namespace Unity.Physics
                         worldFromA, aFromB, maxDistance, out contactManifold);
                     break;
                 default:
-                    throw new NotImplementedException();
+                    SafetyChecks.ThrowNotImplementedException();
+                    return;
             }
 
-            WriteManifold(contactManifold, context, colliderKeys, materialA, materialB, flipped, ref contactWriter);
+            WriteManifold(contactManifold, context, colliderKeys, materialA, materialB, flipped);
         }
 
         private static unsafe void ConvexComposite(
             Context context, ColliderKey convexKeyA,
-            Collider* convexColliderA, Collider* compositeColliderB, MTransform worldFromA, MTransform worldFromB,
-            MotionExpansion expansion, bool flipped, ref BlockStream.Writer contactWriter)
+            [NoAlias] Collider* convexColliderA, [NoAlias] Collider* compositeColliderB, [NoAlias] in MTransform worldFromA, [NoAlias] in MTransform worldFromB,
+            MotionExpansion expansion, bool flipped)
         {
+            Material materialA = ((ConvexColliderHeader*)convexColliderA)->Material;
+
+            // Skip the collision if convexColliderA is marked with a "None" collision response
+            if (materialA.CollisionResponse == CollisionResponsePolicy.None)
+            {
+                return;
+            }
+
             // Calculate swept AABB of A in B
             MTransform bFromWorld = Inverse(worldFromB);
             MTransform bFromA = Mul(bFromWorld, worldFromA);
@@ -377,29 +409,23 @@ namespace Unity.Physics
             var collector = new ConvexCompositeOverlapCollector(
                 context,
                 convexColliderA, convexKeyA, compositeColliderB,
-                worldFromA, worldFromB, expansion.MaxDistance, flipped,
-                contactWriter);
+                worldFromA, worldFromB, expansion.MaxDistance, flipped);
             OverlapQueries.AabbCollider(input, compositeColliderB, ref collector);
-
-            // Keep updated writer state
-            contactWriter = collector.m_ContactWriter;
         }
 
         private static unsafe void CompositeConvex(
             Context context,
-            Collider* compositeColliderA, Collider* convexColliderB, MTransform worldFromA, MTransform worldFromB,
-            MotionExpansion expansion, bool flipped, ref BlockStream.Writer contactWriter)
+            [NoAlias] Collider* compositeColliderA, [NoAlias] Collider* convexColliderB, [NoAlias] in MTransform worldFromA, [NoAlias] in MTransform worldFromB,
+            MotionExpansion expansion, bool flipped)
         {
             // Flip the relevant inputs and call convex-vs-composite
             expansion.Linear *= -1.0f;
             ConvexComposite(context, ColliderKey.Empty,
-                convexColliderB, compositeColliderA, worldFromB, worldFromA, expansion, !flipped,
-                ref contactWriter);
+                convexColliderB, compositeColliderA, worldFromB, worldFromA, expansion, !flipped);
         }
 
         internal unsafe struct ConvexCompositeOverlapCollector : IOverlapCollector
         {
-            // Inputs
             readonly Context m_Context;
             readonly Collider* m_ConvexColliderA;
             readonly ColliderKey m_ConvexColliderKey;
@@ -411,14 +437,10 @@ namespace Unity.Physics
 
             ColliderKeyPath m_CompositeColliderKeyPath;
 
-            // Output
-            internal BlockStream.Writer m_ContactWriter;
-
             public ConvexCompositeOverlapCollector(
                 Context context,
                 Collider* convexCollider, ColliderKey convexColliderKey, Collider* compositeCollider,
-                MTransform worldFromA, MTransform worldFromB, float collisionTolerance, bool flipped,
-                BlockStream.Writer contactWriter)
+                MTransform worldFromA, MTransform worldFromB, float collisionTolerance, bool flipped)
             {
                 m_Context = context;
                 m_ConvexColliderA = convexCollider;
@@ -429,15 +451,11 @@ namespace Unity.Physics
                 m_WorldFromB = worldFromB;
                 m_CollisionTolerance = collisionTolerance;
                 m_Flipped = flipped;
-                m_ContactWriter = contactWriter;
             }
 
-            public void AddRigidBodyIndices(int* indices, int count)
-            {
-                throw new NotSupportedException();
-            }
+            public void AddRigidBodyIndices(int* indices, int count) => SafetyChecks.ThrowNotSupportedException();
 
-            public void AddColliderKeys(ColliderKey* keys, int count)
+            public void AddColliderKeys([NoAlias] ColliderKey* keys, int count)
             {
                 var colliderKeys = new ColliderKeyPair { ColliderKeyA = m_ConvexColliderKey, ColliderKeyB = m_ConvexColliderKey };
                 CollisionFilter filter = m_ConvexColliderA->Filter;
@@ -451,7 +469,7 @@ namespace Unity.Physics
                         Mesh* mesh = &((MeshCollider*)m_CompositeColliderB)->Mesh;
                         uint numMeshKeyBits = mesh->NumColliderKeyBits;
                         var polygon = new PolygonCollider();
-                        polygon.InitEmpty();
+                        polygon.InitNoVertices(CollisionFilter.Default, Material.Default);
                         for (int i = 0; i < count; i++)
                         {
                             ColliderKey compositeKey = m_CompositeColliderKeyPath.GetLeafKey(keys[i]);
@@ -472,16 +490,17 @@ namespace Unity.Physics
                                     case CollisionType.Convex:
                                         ConvexConvex(
                                             m_Context, colliderKeys, m_ConvexColliderA, (Collider*)&polygon,
-                                            m_WorldFromA, m_WorldFromB, m_CollisionTolerance, m_Flipped, ref m_ContactWriter);
+                                            m_WorldFromA, m_WorldFromB, m_CollisionTolerance, m_Flipped);
                                         break;
 
                                     case CollisionType.Terrain:
                                         TerrainConvex(
                                             m_Context, colliderKeys, m_ConvexColliderA, (Collider*)&polygon,
-                                            m_WorldFromA, m_WorldFromB, m_CollisionTolerance, m_Flipped, ref m_ContactWriter);
+                                            m_WorldFromA, m_WorldFromB, m_CollisionTolerance, m_Flipped);
                                         break;
                                     default: // GetLeaf() may not return a composite collider
-                                        throw new NotImplementedException();
+                                        SafetyChecks.ThrowNotImplementedException();
+                                        return;
                                 }
                             }
                         }
@@ -512,15 +531,16 @@ namespace Unity.Physics
                                     case CollisionType.Convex:
                                         ConvexConvex(
                                             m_Context, colliderKeys, m_ConvexColliderA, leaf.Collider,
-                                            m_WorldFromA, worldFromLeafB, m_CollisionTolerance, m_Flipped, ref m_ContactWriter);
+                                            m_WorldFromA, worldFromLeafB, m_CollisionTolerance, m_Flipped);
                                         break;
                                     case CollisionType.Terrain:
                                         ConvexTerrain(
                                             m_Context, colliderKeys, m_ConvexColliderA, leaf.Collider,
-                                            m_WorldFromA, worldFromLeafB, m_CollisionTolerance, m_Flipped, ref m_ContactWriter);
+                                            m_WorldFromA, worldFromLeafB, m_CollisionTolerance, m_Flipped);
                                         break;
                                     default: // GetLeaf() may not return a composite collider
-                                        throw new NotImplementedException();
+                                        SafetyChecks.ThrowNotImplementedException();
+                                        return;
                                 }
                             }
                         }
@@ -543,7 +563,7 @@ namespace Unity.Physics
         private static unsafe void CompositeComposite(
             Context context,
             Collider* compositeColliderA, Collider* compositeColliderB, MTransform worldFromA, MTransform worldFromB,
-            MotionExpansion expansion, bool flipped, ref BlockStream.Writer contactWriter)
+            MotionExpansion expansion, bool flipped)
         {
             // Flip the order if necessary, so that A has fewer leaves than B
             if (compositeColliderA->NumColliderKeyBits > compositeColliderB->NumColliderKeyBits)
@@ -563,12 +583,8 @@ namespace Unity.Physics
             var collector = new CompositeCompositeLeafCollector(
                 context,
                 compositeColliderA, compositeColliderB,
-                worldFromA, worldFromB, expansion, flipped,
-                contactWriter);
+                worldFromA, worldFromB, expansion, flipped);
             compositeColliderA->GetLeaves(ref collector);
-
-            // Keep updated writer state
-            contactWriter = collector.m_ContactWriter;
         }
 
         private unsafe struct CompositeCompositeLeafCollector : ILeafColliderCollector
@@ -584,14 +600,10 @@ namespace Unity.Physics
 
             ColliderKeyPath m_KeyPath;
 
-            // Output
-            internal BlockStream.Writer m_ContactWriter;
-
             public CompositeCompositeLeafCollector(
                 Context context,
                 Collider* compositeColliderA, Collider* compositeColliderB,
-                MTransform worldFromA, MTransform worldFromB, MotionExpansion expansion, bool flipped,
-                BlockStream.Writer contactWriter)
+                MTransform worldFromA, MTransform worldFromB, MotionExpansion expansion, bool flipped)
             {
                 m_Context = context;
                 m_CompositeColliderA = compositeColliderA;
@@ -600,7 +612,6 @@ namespace Unity.Physics
                 m_WorldFromB = worldFromB;
                 m_Expansion = expansion;
                 m_Flipped = flipped;
-                m_ContactWriter = contactWriter;
                 m_KeyPath = ColliderKeyPath.Empty;
             }
 
@@ -609,7 +620,7 @@ namespace Unity.Physics
                 MTransform worldFromLeafA = Mul(m_WorldFromA, new MTransform(leaf.TransformFromChild));
                 ConvexComposite(
                     m_Context, m_KeyPath.GetLeafKey(key), leaf.Collider, m_CompositeColliderB,
-                    worldFromLeafA, m_WorldFromB, m_Expansion, m_Flipped, ref m_ContactWriter);
+                    worldFromLeafA, m_WorldFromB, m_Expansion, m_Flipped);
             }
 
             public void PushCompositeCollider(ColliderKeyPath compositeKey, MTransform parentFromComposite, out MTransform worldFromParent)
@@ -627,19 +638,28 @@ namespace Unity.Physics
         }
 
         private static unsafe void ConvexTerrain(
-            Context context, ColliderKeyPair colliderKeys, Collider* convexColliderA, Collider* terrainColliderB, MTransform worldFromA, MTransform worldFromB,
-            float maxDistance, bool flipped, ref BlockStream.Writer contactWriter)
+            Context context, ColliderKeyPair colliderKeys, [NoAlias] Collider* convexColliderA, [NoAlias] Collider* terrainColliderB, [NoAlias] in MTransform worldFromA, [NoAlias] in MTransform worldFromB,
+            float maxDistance, bool flipped)
         {
             ref var terrain = ref ((TerrainCollider*)terrainColliderB)->Terrain;
 
             Material materialA = ((ConvexColliderHeader*)convexColliderA)->Material;
             Material materialB = ((TerrainCollider*)terrainColliderB)->Material;
 
+            CollisionResponsePolicy combinedCollisionResponse = Material.GetCombinedCollisionResponse(materialA, materialB);
+
+            // Skip the shapes if any of them is marked with a "None" collision response
+            if (combinedCollisionResponse == CollisionResponsePolicy.None)
+            {
+                return;
+            }
+
             // Skip if the bodies have infinite mass and the materials don't want to raise any solver events,
             // since the resulting contacts can't have any effect during solving
             if (context.BodiesHaveInfiniteMass)
             {
-                if (((materialA.Flags | materialB.Flags) & (Material.MaterialFlags.IsTrigger | Material.MaterialFlags.EnableCollisionEvents)) == 0)
+                if (combinedCollisionResponse != CollisionResponsePolicy.RaiseTriggerEvents &&
+                    combinedCollisionResponse != CollisionResponsePolicy.CollideRaiseCollisionEvents)
                 {
                     return;
                 }
@@ -688,7 +708,7 @@ namespace Unity.Physics
                         // The current manifold must be flushed if it's full or the normals don't match
                         if (math.dot(normalInB, normal) < 1 - 1e-5f || manifold.NumContacts == ConvexConvexManifoldQueries.Manifold.k_MaxNumContacts)
                         {
-                            WriteManifold(manifold, context, colliderKeys, materialA, materialB, flipped, ref contactWriter);
+                            WriteManifold(manifold, context, colliderKeys, materialA, materialB, flipped);
                             manifold = new ConvexConvexManifoldQueries.Manifold
                             {
                                 Normal = math.mul(worldFromB.Rotation, normal)
@@ -706,39 +726,35 @@ namespace Unity.Physics
             }
 
             // Flush the last manifold
-            WriteManifold(manifold, context, colliderKeys, materialA, materialB, flipped, ref contactWriter);
+            WriteManifold(manifold, context, colliderKeys, materialA, materialB, flipped);
         }
 
         private static unsafe void TerrainConvex(
             Context context, ColliderKeyPair colliderKeys,
             Collider* terrainColliderA, Collider* convexColliderB, MTransform worldFromA, MTransform worldFromB,
-            float maxDistance, bool flipped, ref BlockStream.Writer contactWriter)
+            float maxDistance, bool flipped)
         {
-            ConvexTerrain(context, colliderKeys, convexColliderB, terrainColliderA, worldFromB, worldFromA, maxDistance, !flipped, ref contactWriter);
+            ConvexTerrain(context, colliderKeys, convexColliderB, terrainColliderA, worldFromB, worldFromA, maxDistance, !flipped);
         }
 
         private static unsafe void CompositeTerrain(
             Context context, Collider* compositeColliderA, Collider* terrainColliderB, MTransform worldFromA, MTransform worldFromB,
-            float maxDistance, bool flipped, ref BlockStream.Writer contactWriter)
+            float maxDistance, bool flipped)
         {
             var collector = new CompositeTerrainLeafCollector(
-                context, compositeColliderA, terrainColliderB, worldFromA, worldFromB, maxDistance, flipped, contactWriter);
+                context, compositeColliderA, terrainColliderB, worldFromA, worldFromB, maxDistance, flipped);
             compositeColliderA->GetLeaves(ref collector);
-
-            // Keep updated writer state
-            contactWriter = collector.m_ContactWriter;
         }
 
         private static unsafe void TerrainComposite(
             Context context, Collider* terrainColliderA, Collider* compositeColliderB, MTransform worldFromA, MTransform worldFromB,
-            float maxDistance, bool flipped, ref BlockStream.Writer contactWriter)
+            float maxDistance, bool flipped)
         {
-            CompositeTerrain(context, compositeColliderB, terrainColliderA, worldFromB, worldFromA, maxDistance, !flipped, ref contactWriter);
+            CompositeTerrain(context, compositeColliderB, terrainColliderA, worldFromB, worldFromA, maxDistance, !flipped);
         }
 
         private unsafe struct CompositeTerrainLeafCollector : ILeafColliderCollector
         {
-            // Inputs
             readonly Context m_Context;
             readonly Collider* m_CompositeColliderA;
             readonly Collider* m_TerrainColliderB;
@@ -749,14 +765,10 @@ namespace Unity.Physics
 
             ColliderKeyPath m_KeyPath;
 
-            // Output
-            internal BlockStream.Writer m_ContactWriter;
-
             public CompositeTerrainLeafCollector(
                 Context context,
                 Collider* compositeColliderA, Collider* terrainColliderB,
-                MTransform worldFromA, MTransform worldFromB, float maxDistance, bool flipped,
-                BlockStream.Writer contactWriter)
+                MTransform worldFromA, MTransform worldFromB, float maxDistance, bool flipped)
             {
                 m_Context = context;
                 m_CompositeColliderA = compositeColliderA;
@@ -765,7 +777,6 @@ namespace Unity.Physics
                 m_WorldFromB = worldFromB;
                 m_MaxDistance = maxDistance;
                 m_Flipped = flipped;
-                m_ContactWriter = contactWriter;
                 m_KeyPath = ColliderKeyPath.Empty;
             }
 
@@ -780,7 +791,7 @@ namespace Unity.Physics
 
                 ConvexTerrain(
                     m_Context, colliderKeys, leaf.Collider, m_TerrainColliderB,
-                    worldFromLeafA, m_WorldFromB, m_MaxDistance, m_Flipped, ref m_ContactWriter);
+                    worldFromLeafA, m_WorldFromB, m_MaxDistance, m_Flipped);
             }
 
             public void PushCompositeCollider(ColliderKeyPath compositeKey, MTransform parentFromComposite, out MTransform worldFromParent)
@@ -796,19 +807,5 @@ namespace Unity.Physics
                 m_KeyPath.PopChildKey(numCompositeKeyBits);
             }
         }
-
-        #region Obsolete
-        [Obsolete("BodyBody(ref PhysicsWorld, BodyIndexPair, float, ref BlockStream.Writer) has been deprecated. Use BodyBody() that takes a pair of bodies and motion velocities instead. (RemovedAfter 2019-12-10)")]
-        public static unsafe void BodyBody(ref PhysicsWorld world, BodyIndexPair pair, float timeStep, ref BlockStream.Writer contactWriter)
-        {
-            RigidBody rigidBodyA = world.Bodies[pair.BodyAIndex];
-            RigidBody rigidBodyB = world.Bodies[pair.BodyBIndex];
-
-            MotionVelocity motionVelocityA = pair.BodyAIndex < world.MotionVelocities.Length ? world.MotionVelocities[pair.BodyAIndex] : MotionVelocity.Zero;
-            MotionVelocity motionVelocityB = pair.BodyBIndex < world.MotionVelocities.Length ? world.MotionVelocities[pair.BodyBIndex] : MotionVelocity.Zero;
-
-            BodyBody(rigidBodyA, rigidBodyB, motionVelocityA, motionVelocityB, world.CollisionWorld.CollisionTolerance, timeStep, pair, ref contactWriter);
-        }
-        #endregion
     }
 }

@@ -16,7 +16,7 @@ namespace Unity.Physics.Authoring
     public unsafe struct DisplayColliderAabbsJob : IJob //<todo.eoin.udebug This can be a parallelfor job
     {
         public DebugStream.Context OutputStream;
-        [ReadOnly] public NativeSlice<RigidBody> Bodies;
+        [ReadOnly] public NativeArray<RigidBody> Bodies;
 
         public void Execute()
         {
@@ -24,12 +24,12 @@ namespace Unity.Physics.Authoring
 
             for (int b = 0; b < Bodies.Length; b++)
             {
-                if (Bodies[b].Collider != null)
+                if (Bodies[b].Collider.IsCreated)
                 {
-                    Aabb aabb = Bodies[b].Collider->CalculateAabb(Bodies[b].WorldFromBody);
+                    Aabb aabb = Bodies[b].Collider.Value.CalculateAabb(Bodies[b].WorldFromBody);
 
                     float3 center = aabb.Center;
-                    OutputStream.Box(aabb.Extents, center, Quaternion.identity, new Color(0.7f, 0.125f, 0.125f));
+                    OutputStream.Box(aabb.Extents, center, Quaternion.identity, DebugDisplay.ColorIndex.BrightRed);
                 }
             }
             OutputStream.End();
@@ -37,8 +37,9 @@ namespace Unity.Physics.Authoring
     }
 
     /// Create a DisplayColliderAabbsJob
+    [UpdateInGroup(typeof(FixedStepSimulationSystemGroup))]
     [UpdateAfter(typeof(BuildPhysicsWorld)), UpdateBefore(typeof(EndFramePhysicsSystem))]
-    public class DisplayColliderAabbsSystem : JobComponentSystem
+    public class DisplayColliderAabbsSystem : SystemBase
     {
         BuildPhysicsWorld m_BuildPhysicsWorldSystem;
         StepPhysicsWorld m_StepPhysicsWorld;
@@ -51,16 +52,16 @@ namespace Unity.Physics.Authoring
             m_DebugStreamSystem = World.GetOrCreateSystem<DebugStream>();
         }
 
-        protected override JobHandle OnUpdate(JobHandle inputDeps)
+        protected override void OnUpdate()
         {
             if (!(HasSingleton<PhysicsDebugDisplayData>() && GetSingleton<PhysicsDebugDisplayData>().DrawColliderAabbs != 0))
             {
-                return inputDeps;
+                return;
             }
 
             if (m_BuildPhysicsWorldSystem.PhysicsWorld.NumBodies == 0)
             {
-                return inputDeps;
+                return;
             }
 
             SimulationCallbacks.Callback callback = (ref ISimulation simulation, ref PhysicsWorld world, JobHandle deps) =>
@@ -72,7 +73,6 @@ namespace Unity.Physics.Authoring
                 }.Schedule(deps);
             };
             m_StepPhysicsWorld.EnqueueCallback(SimulationCallbacks.Phase.PostCreateDispatchPairs, callback);
-            return inputDeps;
         }
     }
 }

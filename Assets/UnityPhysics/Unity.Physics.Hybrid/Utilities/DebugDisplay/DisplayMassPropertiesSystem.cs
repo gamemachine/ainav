@@ -10,8 +10,9 @@ using Unity.Burst;
 namespace Unity.Physics.Authoring
 {
     /// Create and dispatch a DisplayMassPropertiesJob
+    [UpdateInGroup(typeof(FixedStepSimulationSystemGroup))]
     [UpdateAfter(typeof(StepPhysicsWorld)), UpdateBefore(typeof(EndFramePhysicsSystem))]
-    public class DisplayMassPropertiesSystem : JobComponentSystem
+    public class DisplayMassPropertiesSystem : SystemBase
     {
         BuildPhysicsWorld m_BuildPhysicsWorldSystem;
         StepPhysicsWorld m_StepPhysicsWorld;
@@ -26,24 +27,24 @@ namespace Unity.Physics.Authoring
             m_DebugStreamSystem = World.GetOrCreateSystem<DebugStream>();
         }
 
-        protected override JobHandle OnUpdate(JobHandle inputDeps)
+        protected override void OnUpdate()
         {
             if (!(HasSingleton<PhysicsDebugDisplayData>() && GetSingleton<PhysicsDebugDisplayData>().DrawMassProperties != 0))
             {
-                return inputDeps;
+                return;
             }
 
-            inputDeps = JobHandle.CombineDependencies(inputDeps, m_StepPhysicsWorld.FinalSimulationJobHandle);
+            var handle = JobHandle.CombineDependencies(Dependency, m_StepPhysicsWorld.FinalSimulationJobHandle);
 
-            JobHandle handle = new DisplayMassPropertiesJob
+            handle = new DisplayMassPropertiesJob
             {
                 OutputStream = m_DebugStreamSystem.GetContext(1),
                 MotionDatas = m_BuildPhysicsWorldSystem.PhysicsWorld.MotionDatas,
                 MotionVelocities = m_BuildPhysicsWorldSystem.PhysicsWorld.MotionVelocities
-            }.Schedule(inputDeps);
+            }.Schedule(handle);
 
-            m_EndFramePhysicsSystem.HandlesToWaitFor.Add(handle);
-            return handle;
+            m_EndFramePhysicsSystem.AddInputDependency(handle);
+            Dependency = handle;
         }
 
         // Job to write mass properties info to a DebugStream for any moving bodies
@@ -53,8 +54,8 @@ namespace Unity.Physics.Authoring
         {
             public DebugStream.Context OutputStream;
 
-            [ReadOnly] public NativeSlice<MotionData> MotionDatas;
-            [ReadOnly] public NativeSlice<MotionVelocity> MotionVelocities;
+            [ReadOnly] public NativeArray<MotionData> MotionDatas;
+            [ReadOnly] public NativeArray<MotionVelocity> MotionVelocities;
 
             public void Execute()
             {
@@ -64,9 +65,9 @@ namespace Unity.Physics.Authoring
                     float3 com = MotionDatas[m].WorldFromMotion.pos;
                     quaternion o = MotionDatas[m].WorldFromMotion.rot;
 
-                    float3 invInertiaLocal = MotionVelocities[m].InverseInertiaAndMass.xyz;
+                    float3 invInertiaLocal = MotionVelocities[m].InverseInertia;
                     float3 il = new float3(1.0f / invInertiaLocal.x, 1.0f / invInertiaLocal.y, 1.0f / invInertiaLocal.z);
-                    float invMass = MotionVelocities[m].InverseInertiaAndMass.w;
+                    float invMass = MotionVelocities[m].InverseMass;
 
                     // Reverse the inertia tensor computation to build a box which has the inerta tensor 'il'
                     // The diagonal inertia of a box with dimensions h,w,d and mass m is:
@@ -88,7 +89,7 @@ namespace Unity.Physics.Authoring
                     float d = math.sqrt(k.y - h * h);
 
                     float3 boxSize = new float3(h, w, d);
-                    OutputStream.Box(boxSize, com, o, Color.magenta);
+                    OutputStream.Box(boxSize, com, o, DebugDisplay.ColorIndex.Magenta);
                 }
                 OutputStream.End();
             }

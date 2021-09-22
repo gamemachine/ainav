@@ -58,7 +58,7 @@ namespace AiNav
             
             MoveAgentsJob moveJob = new MoveAgentsJob
             {
-                DeltaTime = Time.deltaTime,
+                DeltaTime = Time.DeltaTime,
                 Query = Query,
                 Random = Random
             };

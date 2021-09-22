@@ -1,279 +1,422 @@
-﻿using System;
-using System.ComponentModel;
+using System;
 using Unity.Collections;
+using Unity.Collections.LowLevel.Unsafe;
 using Unity.Jobs;
 using Unity.Jobs.LowLevel.Unsafe;
 using Unity.Mathematics;
 
 namespace Unity.Physics
 {
-    // Implementations of ISimulation
-    public enum SimulationType
+    // Holds temporary data in a storage that lives as long as simulation lives
+    // and is only re-allocated if necessary.
+    public struct SimulationContext : IDisposable
     {
-        NoPhysics,      // A dummy implementation which does nothing
-        UnityPhysics,   // Default C# implementation
-        HavokPhysics    // Havok implementation (using C++ plugin)
+        private int m_NumDynamicBodies;
+        private NativeArray<Velocity> m_InputVelocities;
+
+        // Solver stabilization data (it's completely ok to be unallocated)
+        [NativeDisableContainerSafetyRestriction]
+        private NativeArray<Solver.StabilizationMotionData> m_SolverStabilizationMotionData;
+        internal NativeArray<Solver.StabilizationMotionData> SolverStabilizationMotionData => m_SolverStabilizationMotionData.GetSubArray(0, m_NumDynamicBodies);
+
+        internal float TimeStep;
+
+        internal NativeArray<Velocity> InputVelocities => m_InputVelocities.GetSubArray(0, m_NumDynamicBodies);
+
+        internal NativeStream CollisionEventDataStream;
+        internal NativeStream TriggerEventDataStream;
+
+        public CollisionEvents CollisionEvents => new CollisionEvents(CollisionEventDataStream, InputVelocities, TimeStep);
+        public TriggerEvents TriggerEvents => new TriggerEvents(TriggerEventDataStream);
+
+        private NativeArray<int> WorkItemCount;
+
+        // Resets the simulation storage
+        // - Reallocates input velocities storage if necessary
+        // - Disposes event streams and allocates new ones with a single work item
+        // NOTE: Reset or ScheduleReset needs to be called before passing the SimulationContext
+        // to a simulation step job. If you don't then you may get initialization errors.
+        public void Reset(SimulationStepInput stepInput)
+        {
+            m_NumDynamicBodies = stepInput.World.NumDynamicBodies;
+            if (!m_InputVelocities.IsCreated || m_InputVelocities.Length < m_NumDynamicBodies)
+            {
+                if (m_InputVelocities.IsCreated)
+                {
+                    m_InputVelocities.Dispose();
+                }
+                m_InputVelocities = new NativeArray<Velocity>(m_NumDynamicBodies, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+            }
+
+            // Solver stabilization data
+            if (stepInput.SolverStabilizationHeuristicSettings.EnableSolverStabilization)
+            {
+                if (!m_SolverStabilizationMotionData.IsCreated || m_SolverStabilizationMotionData.Length < m_NumDynamicBodies)
+                {
+                    if (m_SolverStabilizationMotionData.IsCreated)
+                    {
+                        m_SolverStabilizationMotionData.Dispose();
+                    }
+                    m_SolverStabilizationMotionData = new NativeArray<Solver.StabilizationMotionData>(m_NumDynamicBodies, Allocator.Persistent, NativeArrayOptions.ClearMemory);
+                }
+                else if (m_NumDynamicBodies > 0)
+                {
+                    unsafe
+                    {
+                        UnsafeUtility.MemClear(m_SolverStabilizationMotionData.GetUnsafePtr(), m_NumDynamicBodies * UnsafeUtility.SizeOf<Solver.StabilizationMotionData>());
+                    }
+                }
+            }
+
+            if (CollisionEventDataStream.IsCreated)
+            {
+                CollisionEventDataStream.Dispose();
+            }
+            if (TriggerEventDataStream.IsCreated)
+            {
+                TriggerEventDataStream.Dispose();
+            }
+            
+            {
+                if (!WorkItemCount.IsCreated)
+                {
+                    WorkItemCount = new NativeArray<int>(new int[] { 1 }, Allocator.Persistent);
+                }
+                CollisionEventDataStream = new NativeStream(WorkItemCount[0], Allocator.Persistent);
+                TriggerEventDataStream = new NativeStream(WorkItemCount[0], Allocator.Persistent);
+            }
+        }
+
+        // TODO: We need to make a public version of ScheduleReset for use with
+        // local simulation calling StepImmediate and chaining jobs over a number
+        // of steps. This becomes a problem if new bodies are added to the world
+        // between simulation steps.
+        // A public version could take the form:
+        //         public JobHandle ScheduleReset(ref PhysicsWorld world, JobHandle inputDeps = default)
+        //         {
+        //             return ScheduleReset(ref world, inputDeps, true);
+        //         }
+        // However, to make that possible we need a why to allocate InputVelocities within a job.
+        // The core simulation does not chain jobs across multiple simulation steps and so 
+        // will not hit this issue.
+        internal JobHandle ScheduleReset(SimulationStepInput stepInput, JobHandle inputDeps, bool allocateEventDataStreams)
+        {
+            m_NumDynamicBodies = stepInput.World.NumDynamicBodies;
+            if (!m_InputVelocities.IsCreated || m_InputVelocities.Length < m_NumDynamicBodies)
+            {
+                // TODO: can we find a way to setup InputVelocities within a job?
+                if (m_InputVelocities.IsCreated)
+                {
+                    m_InputVelocities.Dispose();
+                }
+                m_InputVelocities = new NativeArray<Velocity>(m_NumDynamicBodies, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+            }
+
+            // Solver stabilization data
+            if (stepInput.SolverStabilizationHeuristicSettings.EnableSolverStabilization)
+            {
+                if (!m_SolverStabilizationMotionData.IsCreated || m_SolverStabilizationMotionData.Length < m_NumDynamicBodies)
+                {
+                    if (m_SolverStabilizationMotionData.IsCreated)
+                    {
+                        m_SolverStabilizationMotionData.Dispose();
+                    }
+                    m_SolverStabilizationMotionData = new NativeArray<Solver.StabilizationMotionData>(m_NumDynamicBodies, Allocator.Persistent, NativeArrayOptions.ClearMemory);
+                }
+                else if (m_NumDynamicBodies > 0)
+                {
+                    unsafe
+                    {
+                        UnsafeUtility.MemClear(m_SolverStabilizationMotionData.GetUnsafePtr(), m_NumDynamicBodies * UnsafeUtility.SizeOf<Solver.StabilizationMotionData>());
+                    }
+                }
+            }
+
+            var handle = inputDeps;
+            if (CollisionEventDataStream.IsCreated)
+            {
+                handle = CollisionEventDataStream.Dispose(handle);
+            }
+            if (TriggerEventDataStream.IsCreated)
+            {
+                handle = TriggerEventDataStream.Dispose(handle);
+            }
+            if (allocateEventDataStreams)
+            {
+                if (!WorkItemCount.IsCreated)
+                {
+                    WorkItemCount = new NativeArray<int>(new int[] { 1 }, Allocator.Persistent);
+                }
+                handle = NativeStream.ScheduleConstruct(out CollisionEventDataStream, WorkItemCount, handle, Allocator.Persistent);
+                handle = NativeStream.ScheduleConstruct(out TriggerEventDataStream, WorkItemCount, handle, Allocator.Persistent);
+            }
+            return handle;
+        }
+
+        public void Dispose()
+        {
+            if (m_InputVelocities.IsCreated)
+            {
+                m_InputVelocities.Dispose();
+            }
+
+            if (m_SolverStabilizationMotionData.IsCreated)
+            {
+                m_SolverStabilizationMotionData.Dispose();
+            }
+
+            if (CollisionEventDataStream.IsCreated)
+            {
+                CollisionEventDataStream.Dispose();
+            }
+
+            if (TriggerEventDataStream.IsCreated)
+            {
+                TriggerEventDataStream.Dispose();
+            }
+
+            if (WorkItemCount.IsCreated)
+            {
+                WorkItemCount.Dispose();
+            }
+        }
     }
 
-    // Parameters for a simulation step
-    public struct SimulationStepInput
+    // Temporary data created and destroyed during the step
+    internal struct StepContext
     {
-        public PhysicsWorld World;
-        public float TimeStep;
-        public float3 Gravity;
-        public int ThreadCountHint;
-        public int NumSolverIterations;
-        public bool SynchronizeCollisionWorld;  // whether to update the collision world after the step
-        public SimulationCallbacks Callbacks;
-    }
+        // Built by the scheduler. Groups body pairs into phases in which each
+        // body appears at most once, so that the interactions within each phase can be solved
+        // in parallel with each other but not with other phases. This is consumed by the
+        // ProcessBodyPairsJob, which outputs contact and joint Jacobians.
+        public NativeList<DispatchPairSequencer.DispatchPair> PhasedDispatchPairs;
 
-    // Interface for simulations
-    public interface ISimulation : IDisposable
-    {
-        // The implementation type
-        SimulationType Type { get; }
+        // Built by the scheduler. Describes the grouping of PhasedBodyPairs
+        // which informs how we can schedule the solver jobs and where they read info from.
+        public DispatchPairSequencer.SolverSchedulerInfo SolverSchedulerInfo;
 
-        // Step the simulation (single threaded)
-        void Step(SimulationStepInput input);
-
-        // Schedule a set of jobs to step the simulation
-        void ScheduleStepJobs(SimulationStepInput input, JobHandle inputDeps);
-
-        // The final scheduled simulation job.
-        // Jobs which use the simulation results should depend on this.
-        JobHandle FinalSimulationJobHandle { get; }
-
-        // The final scheduled job, including all simulation and cleanup.
-        // The end of each step should depend on this.
-        JobHandle FinalJobHandle { get; }
-
-        #region Obsolete
-        [EditorBrowsable(EditorBrowsableState.Never)]
-        [Obsolete("ScheduleStepJobs(SimulationStepInput, JobHandle, out JobHandle, out JobHandle) has been deprecated. Use ScheduleStepJobs(SimulationStepInput, JobHandle) instead. (RemovedAfter 2019-10-15)", true)]
-        void ScheduleStepJobs(SimulationStepInput input, JobHandle inputDeps, out JobHandle finalSimulationJobHandle, out JobHandle finalJobHandle);
-        #endregion
+        public NativeStream Contacts;
+        public NativeStream Jacobians;
     }
 
     // Default simulation implementation
     public class Simulation : ISimulation
     {
         public SimulationType Type => SimulationType.UnityPhysics;
-        public JobHandle FinalSimulationJobHandle { get; protected set; }
-        public JobHandle FinalJobHandle { get; protected set; }
+        public JobHandle FinalSimulationJobHandle => m_StepHandles.FinalExecutionHandle;
+        public JobHandle FinalJobHandle => JobHandle.CombineDependencies(FinalSimulationJobHandle, m_StepHandles.FinalDisposeHandle);
 
-        internal Context m_Context;
-        internal LowLevel.CollisionEvents CollisionEvents => new LowLevel.CollisionEvents(m_Context.CollisionEventStream);
-        internal LowLevel.TriggerEvents TriggerEvents => new LowLevel.TriggerEvents(m_Context.TriggerEventStream);
+        internal StepContext StepContext = new StepContext();
 
-        private Storage m_Storage;
-        private readonly Scheduler m_Scheduler;
+        public CollisionEvents CollisionEvents => SimulationContext.CollisionEvents;
 
-        public Simulation()
-        {
-            m_Scheduler = new Scheduler();
-            m_Context = new Context();
-            m_Storage = new Storage();
-        }
+        public TriggerEvents TriggerEvents => SimulationContext.TriggerEvents;
+
+        internal SimulationContext SimulationContext = new SimulationContext();
+
+        private readonly DispatchPairSequencer m_Scheduler = new DispatchPairSequencer();
+        private SimulationJobHandles m_StepHandles = new SimulationJobHandles(new JobHandle());
 
         public void Dispose()
         {
             m_Scheduler.Dispose();
-            m_Storage.Dispose();
-            DisposeEventStreams(new JobHandle()).Complete();
+            SimulationContext.Dispose();
         }
 
-        public void Step(SimulationStepInput input)
+        // Steps the simulation immediately on a single thread without spawning any jobs.
+        public static void StepImmediate(SimulationStepInput input, ref SimulationContext simulationContext)
         {
-            // TODO : Using the multithreaded version for now, but should do a proper single threaded version
-            ScheduleStepJobs(input, new JobHandle());
-            FinalJobHandle.Complete();
-        }
-
-        // Schedule all the jobs for the simulation step.
-        // Enqueued callbacks can choose to inject additional jobs at defined sync points.
-        public unsafe void ScheduleStepJobs(SimulationStepInput input, JobHandle inputDeps)
-        {
-            if (input.TimeStep < 0)
-                throw new ArgumentOutOfRangeException();
-            if (input.ThreadCountHint <= 0)
-                throw new ArgumentOutOfRangeException();
-            if (input.NumSolverIterations <= 0)
-                throw new ArgumentOutOfRangeException();
-
-            // Dispose event streams from previous frame
-            JobHandle handle = DisposeEventStreams(inputDeps);
-
-            // Allocate storage for input velocities
-            m_Storage.InputVelocityCount = input.World.NumDynamicBodies;
-
-            m_Context = new Context
-            {
-                TimeStep = input.TimeStep,
-                InputVelocities = m_Storage.InputVelocities
-            };
+            SafetyChecks.CheckFiniteAndPositiveAndThrow(input.TimeStep, nameof(input.TimeStep));
+            SafetyChecks.CheckInRangeAndThrow(input.NumSolverIterations, new int2(1, int.MaxValue), nameof(input.NumSolverIterations));
 
             if (input.World.NumDynamicBodies == 0)
             {
                 // No need to do anything, since nothing can move
-                FinalSimulationJobHandle = handle;
-                FinalJobHandle = handle;
                 return;
             }
 
-            SimulationCallbacks callbacks = input.Callbacks ?? new SimulationCallbacks();
+            // Inform the context of the timeStep
+            simulationContext.TimeStep = input.TimeStep;
 
             // Find all body pairs that overlap in the broadphase
-            handle = input.World.CollisionWorld.Broadphase.ScheduleFindOverlapsJobs(
-                out BlockStream dynamicVsDynamicBodyPairs, out BlockStream dynamicVsStaticBodyPairs, ref m_Context, handle);
+            var dynamicVsDynamicBodyPairs = new NativeStream(1, Allocator.Temp);
+            var dynamicVsStaticBodyPairs = new NativeStream(1, Allocator.Temp);
+            {
+                var dynamicVsDynamicBodyPairsWriter = dynamicVsDynamicBodyPairs.AsWriter();
+                var dynamicVsStaticBodyPairsWriter = dynamicVsStaticBodyPairs.AsWriter();
+                input.World.CollisionWorld.FindOverlaps(ref dynamicVsDynamicBodyPairsWriter, ref dynamicVsStaticBodyPairsWriter);
+            }
+
+            // Create dispatch pairs
+            var dispatchPairs = new NativeList<DispatchPairSequencer.DispatchPair>(Allocator.Temp);
+            DispatchPairSequencer.CreateDispatchPairs(ref dynamicVsDynamicBodyPairs, ref dynamicVsStaticBodyPairs,
+                input.World.NumDynamicBodies, input.World.Joints, ref dispatchPairs);
+
+            // Apply gravity and copy input velocities
+            Solver.ApplyGravityAndCopyInputVelocities(input.World.DynamicsWorld.MotionVelocities,
+                simulationContext.InputVelocities, input.TimeStep * input.Gravity);
+
+            // Narrow phase
+            var contacts = new NativeStream(1, Allocator.Temp);
+            {
+                var contactsWriter = contacts.AsWriter();
+                NarrowPhase.CreateContacts(ref input.World, dispatchPairs.AsArray(), input.TimeStep, ref contactsWriter);
+            }
+
+            // Build Jacobians
+            var jacobians = new NativeStream(1, Allocator.Temp);
+            {
+                var contactsReader = contacts.AsReader();
+                var jacobiansWriter = jacobians.AsWriter();
+                Solver.BuildJacobians(ref input.World, input.TimeStep, input.Gravity, input.NumSolverIterations,
+                    dispatchPairs.AsArray(), ref contactsReader, ref jacobiansWriter);
+            }
+
+            // Solve Jacobians
+            {
+                var jacobiansReader = jacobians.AsReader();
+                var collisionEventsWriter = simulationContext.CollisionEventDataStream.AsWriter();
+                var triggerEventsWriter = simulationContext.TriggerEventDataStream.AsWriter();
+                Solver.StabilizationData solverStabilizationData = new Solver.StabilizationData(input, simulationContext);
+                Solver.SolveJacobians(ref jacobiansReader, input.World.DynamicsWorld.MotionVelocities,
+                    input.TimeStep, input.NumSolverIterations, ref collisionEventsWriter, ref triggerEventsWriter, solverStabilizationData);
+            }
+
+            // Integrate motions
+            Integrator.Integrate(input.World.DynamicsWorld.MotionDatas, input.World.DynamicsWorld.MotionVelocities, input.TimeStep);
+
+            // Synchronize the collision world if asked for
+            if (input.SynchronizeCollisionWorld)
+            {
+                input.World.CollisionWorld.UpdateDynamicTree(ref input.World, input.TimeStep, input.Gravity);
+            }
+        }
+
+        public void Step(SimulationStepInput input)
+        {
+            StepImmediate(input, ref SimulationContext);
+        }
+
+        [Obsolete("ScheduleStepJobs() has been deprecated. Please use the new method taking a bool as the last parameter. (RemovedAfter 2021-02-15)", true)]
+        public unsafe SimulationJobHandles ScheduleStepJobs(SimulationStepInput input, SimulationCallbacks callbacksIn, JobHandle inputDeps, int threadCountHint = 0)
+        {
+            return ScheduleStepJobs(input, callbacksIn, inputDeps, threadCountHint > 0);
+        }
+
+        // Schedule all the jobs for the simulation step.
+        // Enqueued callbacks can choose to inject additional jobs at defined sync points.
+        // multiThreaded defines which simulation type will be called:
+        //     - true will result in default multithreaded simulation
+        //     - false will result in a very small number of jobs (1 per physics step phase) that are scheduled sequentially
+        // Behavior doesn't change regardless of the multiThreaded argument provided.
+        public unsafe SimulationJobHandles ScheduleStepJobs(SimulationStepInput input, SimulationCallbacks callbacksIn, JobHandle inputDeps, bool multiThreaded = true)
+        {
+            SafetyChecks.CheckFiniteAndPositiveAndThrow(input.TimeStep, nameof(input.TimeStep));
+            SafetyChecks.CheckInRangeAndThrow(input.NumSolverIterations, new int2(1, int.MaxValue), nameof(input.NumSolverIterations));
+
+            // Dispose and reallocate input velocity buffer, if dynamic body count has increased.
+            // Dispose previous collision and trigger event data streams. 
+            // New event streams are reallocated later when the work item count is known.
+            JobHandle handle = SimulationContext.ScheduleReset(input, inputDeps, false);
+            SimulationContext.TimeStep = input.TimeStep;
+
+            StepContext = new StepContext();
+
+            if (input.World.NumDynamicBodies == 0)
+            {
+                // No need to do anything, since nothing can move
+                m_StepHandles = new SimulationJobHandles(handle);
+                return m_StepHandles;
+            }
+
+            SimulationCallbacks callbacks = callbacksIn ?? new SimulationCallbacks();
+
+            // Find all body pairs that overlap in the broadphase
+            var handles = input.World.CollisionWorld.ScheduleFindOverlapsJobs(
+                out NativeStream dynamicVsDynamicBodyPairs, out NativeStream dynamicVsStaticBodyPairs, handle, multiThreaded);
+            handle = handles.FinalExecutionHandle;
+            var disposeHandle1 = handles.FinalDisposeHandle;
             var postOverlapsHandle = handle;
 
             // Sort all overlapping and jointed body pairs into phases
-            handle = m_Scheduler.ScheduleCreatePhasedDispatchPairsJob(
-                ref input.World, ref dynamicVsDynamicBodyPairs, ref dynamicVsStaticBodyPairs, ref m_Context, handle);
+            handles = m_Scheduler.ScheduleCreatePhasedDispatchPairsJob(
+                ref input.World, ref dynamicVsDynamicBodyPairs, ref dynamicVsStaticBodyPairs, handle,
+                ref StepContext.PhasedDispatchPairs, out StepContext.SolverSchedulerInfo, multiThreaded);
+            handle = handles.FinalExecutionHandle;
+            var disposeHandle2 = handles.FinalDisposeHandle;
 
             // Apply gravity and copy input velocities at this point (in parallel with the scheduler, but before the callbacks)
             var applyGravityAndCopyInputVelocitiesHandle = Solver.ScheduleApplyGravityAndCopyInputVelocitiesJob(
-                ref input.World.DynamicsWorld, m_Storage.InputVelocities, input.TimeStep * input.Gravity, postOverlapsHandle);
+                input.World.DynamicsWorld.MotionVelocities, SimulationContext.InputVelocities,
+                input.TimeStep * input.Gravity, multiThreaded ? postOverlapsHandle : handle, multiThreaded);
 
             handle = JobHandle.CombineDependencies(handle, applyGravityAndCopyInputVelocitiesHandle);
             handle = callbacks.Execute(SimulationCallbacks.Phase.PostCreateDispatchPairs, this, ref input.World, handle);
 
             // Create contact points & joint Jacobians
-            handle = NarrowPhase.ScheduleProcessBodyPairsJobs(ref input.World, input.TimeStep, input.NumSolverIterations, ref m_Context, handle);
+            handles = NarrowPhase.ScheduleCreateContactsJobs(ref input.World, input.TimeStep,
+                ref StepContext.Contacts, ref StepContext.Jacobians, ref StepContext.PhasedDispatchPairs, handle,
+                ref StepContext.SolverSchedulerInfo, multiThreaded);
+            handle = handles.FinalExecutionHandle;
+            var disposeHandle3 = handles.FinalDisposeHandle;
             handle = callbacks.Execute(SimulationCallbacks.Phase.PostCreateContacts, this, ref input.World, handle);
 
             // Create contact Jacobians
-            handle = Solver.ScheduleBuildContactJacobiansJobs(ref input.World.DynamicsWorld, input.TimeStep, math.length(input.Gravity), ref m_Context, handle);
+            handles = Solver.ScheduleBuildJacobiansJobs(ref input.World, input.TimeStep, input.Gravity, input.NumSolverIterations,
+                handle, ref StepContext.PhasedDispatchPairs, ref StepContext.SolverSchedulerInfo,
+                ref StepContext.Contacts, ref StepContext.Jacobians, multiThreaded);
+            handle = handles.FinalExecutionHandle;
+            var disposeHandle4 = handles.FinalDisposeHandle;
             handle = callbacks.Execute(SimulationCallbacks.Phase.PostCreateContactJacobians, this, ref input.World, handle);
 
             // Solve all Jacobians
-            handle = Solver.ScheduleSolveJacobiansJobs(ref input.World.DynamicsWorld, input.TimeStep, input.NumSolverIterations, ref m_Context, handle);
+            Solver.StabilizationData solverStabilizationData = new Solver.StabilizationData(input, SimulationContext);
+            handles = Solver.ScheduleSolveJacobiansJobs(ref input.World.DynamicsWorld, input.TimeStep, input.NumSolverIterations,
+                ref StepContext.Jacobians, ref SimulationContext.CollisionEventDataStream, ref SimulationContext.TriggerEventDataStream,
+                ref StepContext.SolverSchedulerInfo, solverStabilizationData, handle, multiThreaded);
+            handle = handles.FinalExecutionHandle;
+            var disposeHandle5 = handles.FinalDisposeHandle;
             handle = callbacks.Execute(SimulationCallbacks.Phase.PostSolveJacobians, this, ref input.World, handle);
 
             // Integrate motions
-            handle = Integrator.ScheduleIntegrateJobs(ref input.World.DynamicsWorld, input.TimeStep, handle);
+            handle = Integrator.ScheduleIntegrateJobs(ref input.World.DynamicsWorld, input.TimeStep, handle, multiThreaded);
 
             // Synchronize the collision world
             if (input.SynchronizeCollisionWorld)
             {
-                handle = input.World.CollisionWorld.ScheduleUpdateDynamicLayer(ref input.World, input.TimeStep, input.Gravity, input.ThreadCountHint, handle);  // TODO: timeStep = 0?
+                handle = input.World.CollisionWorld.ScheduleUpdateDynamicTree(ref input.World, input.TimeStep, input.Gravity, handle, multiThreaded);  // TODO: timeStep = 0?
             }
 
             // Return the final simulation handle
-            FinalSimulationJobHandle = handle;
+            m_StepHandles.FinalExecutionHandle = handle;
 
-            // Return the final handle, which includes disposing temporary arrays
-            JobHandle* deps = stackalloc JobHandle[11]
+            // Different dispose logic for single threaded simulation compared to "standard" threading (multi threaded)
+            if (!multiThreaded)
             {
-                FinalSimulationJobHandle,
-                m_Context.DisposeOverlapPairs0,
-                m_Context.DisposeOverlapPairs1,
-                m_Context.DisposeBroadphasePairs0,
-                m_Context.DisposeBroadphasePairs1,
-                m_Context.DisposeContacts,
-                m_Context.DisposeJacobians,
-                m_Context.DisposeJointJacobians,
-                m_Context.DisposeSolverSchedulerData,
-                m_Context.DisposeProcessBodyPairs,
-                m_Context.DisposePhasedDispatchPairs
-            };
-            FinalJobHandle = JobHandleUnsafeUtility.CombineDependencies(deps, 11);
-        }
+                handle = dynamicVsDynamicBodyPairs.Dispose(handle);
+                handle = dynamicVsStaticBodyPairs.Dispose(handle);
+                handle = StepContext.PhasedDispatchPairs.Dispose(handle);
+                handle = StepContext.Contacts.Dispose(handle);
+                handle = StepContext.Jacobians.Dispose(handle);
+                handle = StepContext.SolverSchedulerInfo.ScheduleDisposeJob(handle);
 
-        // Event streams live until the next step, so they should be disposed at the beginning of it
-        private JobHandle DisposeEventStreams(JobHandle inDeps)
-        {
-            if (m_Context.CollisionEventStream.IsCreated)
-            {
-                inDeps = m_Context.CollisionEventStream.Dispose(inDeps);
+                m_StepHandles.FinalDisposeHandle = handle;
             }
-            if (m_Context.TriggerEventStream.IsCreated)
+            else
             {
-                inDeps = m_Context.TriggerEventStream.Dispose(inDeps);
-            }
-
-            return inDeps;
-        }
-
-        // Holds temporary data in a storage that lives as long as simulation lives
-        // and is only re-allocated if necessary.
-        private struct Storage : IDisposable
-        {
-            private int m_InputVelocityCount;
-
-            private NativeArray<Velocity> m_InputVelocities;
-
-            public NativeSlice<Velocity> InputVelocities => new NativeSlice<Velocity>(m_InputVelocities, 0, m_InputVelocityCount);
-
-            public int InputVelocityCount
-            {
-                get => m_InputVelocityCount;
-                set
+                // Return the final handle, which includes disposing temporary arrays
+                JobHandle* deps = stackalloc JobHandle[5]
                 {
-                    m_InputVelocityCount = value;
-                    if (m_InputVelocities.Length < m_InputVelocityCount)
-                    {
-                        if (m_InputVelocities.IsCreated)
-                        {
-                            m_InputVelocities.Dispose();
-                        }
-                        m_InputVelocities = new NativeArray<Velocity>(m_InputVelocityCount, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
-                    }
-                }
+                    disposeHandle1,
+                    disposeHandle2,
+                    disposeHandle3,
+                    disposeHandle4,
+                    disposeHandle5
+                };
+                m_StepHandles.FinalDisposeHandle = JobHandleUnsafeUtility.CombineDependencies(deps, 5);
             }
 
-            public void Dispose()
-            {
-                m_InputVelocities.Dispose();
-            }
+            return m_StepHandles;
         }
-
-        // Temporary data created and destroyed during the step
-        internal struct Context
-        {
-            // Delta time used to step the simulation
-            public float TimeStep;
-
-            // Copy of MotionVelocity velocities from the start of the step
-            public NativeSlice<Velocity> InputVelocities;
-
-            // Built by the scheduler. Groups body pairs into phases in which each
-            // body appears at most once, so that the interactions within each phase can be solved
-            // in parallel with each other but not with other phases. This is consumed by the
-            // ProcessBodyPairsJob, which outputs contact and joint Jacobians.
-            public NativeList<Scheduler.DispatchPair> PhasedDispatchPairs;
-
-            // Built by the scheduler. Describes the grouping of PhasedBodyPairs
-            // which informs how we can schedule the solver jobs and where they read info from.
-            public Scheduler.SolverSchedulerInfo SolverSchedulerInfo;
-
-            public BlockStream Contacts;
-            public BlockStream Jacobians;
-            public BlockStream JointJacobians;
-            public BlockStream CollisionEventStream;
-            public BlockStream TriggerEventStream;
-
-            public JobHandle DisposeOverlapPairs0;
-            public JobHandle DisposeOverlapPairs1;
-            public JobHandle DisposeBroadphasePairs0;
-            public JobHandle DisposeBroadphasePairs1;
-            public JobHandle DisposeContacts;
-            public JobHandle DisposeJacobians;
-            public JobHandle DisposeJointJacobians;
-            public JobHandle DisposeSolverSchedulerData;
-            public JobHandle DisposeProcessBodyPairs;
-            public JobHandle DisposePhasedDispatchPairs;
-        }
-
-        #region Obsolete
-        [EditorBrowsable(EditorBrowsableState.Never)]
-        [Obsolete("ScheduleStepJobs(SimulationStepInput, JobHandle, out JobHandle, out JobHandle) has been deprecated. Use ScheduleStepJobs(SimulationStepInput, JobHandle) instead. (RemovedAfter 2019-10-15)")]
-        public void ScheduleStepJobs(SimulationStepInput input, JobHandle inputDeps, out JobHandle finalSimulationJobHandle, out JobHandle finalJobHandle)
-        {
-            finalSimulationJobHandle = FinalSimulationJobHandle;
-            finalJobHandle = FinalJobHandle;
-            ScheduleStepJobs(input, inputDeps);
-        }
-        #endregion
     }
 }

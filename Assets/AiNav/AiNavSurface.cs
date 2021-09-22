@@ -117,7 +117,6 @@ namespace AiNav
             DtBoundingBox box = DtBoundingBox.FromUnityBounds(bounds);
 
             var controller = Controller;
-
             controller.MarkDirty(box);
             Controller.OnBuildCompleted -= OnBuildCompleted;
             controller.OnBuildCompleted += OnBuildCompleted;

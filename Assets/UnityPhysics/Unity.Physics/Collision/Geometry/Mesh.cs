@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
+using Unity.Burst;
 using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
 using Unity.Mathematics;
@@ -55,6 +56,8 @@ namespace Unity.Physics
             public BlobArray.Accessor<Material> Materials => new BlobArray.Accessor<Material>(ref MaterialsBlob);
         }
 
+        internal float m_BoundingRadius;
+
         // The bounding volume
         private BlobArray m_BvhNodesBlob;
         public unsafe BoundingVolumeHierarchy BoundingVolumeHierarchy
@@ -73,13 +76,29 @@ namespace Unity.Physics
         private BlobArray m_SectionsBlob;
         public BlobArray.Accessor<Section> Sections => new BlobArray.Accessor<Section>(ref m_SectionsBlob);
 
+        internal void UpdateCachedBoundingRadius()
+        {
+            float3 center = BoundingVolumeHierarchy.Domain.Center;
+            float boundingRadiusSq = 0;
+
+            for (int i = 0; i < Sections.Length; ++i)
+            {
+                var vertices = Sections[i].Vertices;
+                for (int j = 0; j < vertices.Length; ++j)
+                {
+                    boundingRadiusSq = math.max(math.distancesq(center, vertices[j]), boundingRadiusSq);
+                }
+            }
+
+            m_BoundingRadius = math.sqrt(boundingRadiusSq);
+        }
 
         // Get the number of bits required to store a key to any of the leaf colliders
         public uint NumColliderKeyBits => (uint)((32 - math.lzcnt(Sections.Length - 1)) + 8 + 1);
 
         // Burst friendly HasFlag
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static bool IsPrimitveFlagSet(PrimitiveFlags flags, PrimitiveFlags testFlag) => (flags & testFlag) != 0;
+        public static bool IsPrimitiveFlagSet(PrimitiveFlags flags, PrimitiveFlags testFlag) => (flags & testFlag) != 0;
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static int GetNumPolygonsInPrimitive(PrimitiveFlags primitiveFlags) => primitiveFlags == PrimitiveFlags.IsTrianglePair ? 2 : 1;
@@ -168,7 +187,7 @@ namespace Unity.Physics
                 section.Vertices[vertexIndices.D]);
 
             PrimitiveFlags flags = section.PrimitiveFlags[sectionPrimitiveIndex];
-            if (IsPrimitveFlagSet(flags, PrimitiveFlags.IsQuad))
+            if (IsPrimitiveFlagSet(flags, PrimitiveFlags.IsQuad))
             {
                 polygon.SetAsQuad(vertices[0], vertices[1], vertices[2], vertices[3]);
             }
@@ -183,7 +202,7 @@ namespace Unity.Physics
             return true;
         }
 
-        internal bool GetFirstPolygon(out uint meshKey, ref PolygonCollider polygon)
+        internal bool GetFirstPolygon([NoAlias] out uint meshKey, [NoAlias] ref PolygonCollider polygon)
         {
             if (Sections.Length == 0 || Sections[0].PrimitiveFlags.Length == 0)
             {
@@ -202,7 +221,7 @@ namespace Unity.Physics
                 section.Vertices[vertexIndices.D]);
 
             PrimitiveFlags flags = section.PrimitiveFlags[0];
-            if (IsPrimitveFlagSet(flags, PrimitiveFlags.IsQuad))
+            if (IsPrimitiveFlagSet(flags, PrimitiveFlags.IsQuad))
             {
                 polygon.SetAsQuad(vertices[0], vertices[1], vertices[2], vertices[3]);
             }
@@ -220,7 +239,7 @@ namespace Unity.Physics
             return true;
         }
 
-        internal bool GetNextPolygon(uint previousMeshKey, out uint meshKey, ref PolygonCollider polygon)
+        internal bool GetNextPolygon(uint previousMeshKey, [NoAlias] out uint meshKey, [NoAlias] ref PolygonCollider polygon)
         {
             int primitiveKey = (int)previousMeshKey >> 1;
             int polygonIndex = (int)previousMeshKey & 1;
@@ -232,7 +251,7 @@ namespace Unity.Physics
             {
                 ref Section section = ref Sections[sectionIndex];
 
-                if (polygonIndex == 0 && IsPrimitveFlagSet(section.PrimitiveFlags[sectionPrimitiveIndex], PrimitiveFlags.IsTrianglePair))
+                if (polygonIndex == 0 && IsPrimitiveFlagSet(section.PrimitiveFlags[sectionPrimitiveIndex], PrimitiveFlags.IsTrianglePair))
                 {
                     // Move to next triangle
                     polygonIndex = 1;
@@ -271,7 +290,7 @@ namespace Unity.Physics
                     section.Vertices[vertexIndices.D]);
 
                 PrimitiveFlags flags = section.PrimitiveFlags[sectionPrimitiveIndex];
-                if (IsPrimitveFlagSet(flags, PrimitiveFlags.IsQuad))
+                if (IsPrimitiveFlagSet(flags, PrimitiveFlags.IsQuad))
                 {
                     polygon.SetAsQuad(vertices[0], vertices[1], vertices[2], vertices[3]);
                 }
@@ -387,7 +406,7 @@ namespace Unity.Physics
 
                 section->MaterialsBlob.Offset = UnsafeEx.CalculateOffset(end, ref section->MaterialsBlob);
                 section->MaterialsBlob.Length = 1;
-                end += Math.NextMultipleOf(section->FiltersBlob.Length * sizeof(Material), 4);
+                end += Math.NextMultipleOf(section->MaterialsBlob.Length * sizeof(Material), 4);
 
                 Sections[sectionIndex].Materials[0] = material;
                 for (int i = 0; i < range.PrimitivesLength; i++)

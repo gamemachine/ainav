@@ -1,31 +1,47 @@
 using System;
 using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
+using Unity.Entities;
 using Unity.Jobs;
 using Unity.Jobs.LowLevel.Unsafe;
 using Unity.Mathematics;
-using EditorBrowsableAttribute = System.ComponentModel.EditorBrowsableAttribute;
-using EditorBrowsableState = System.ComponentModel.EditorBrowsableState;
 
 namespace Unity.Physics
 {
-    // Interface for jobs that iterate through the list of contact manifolds produced by the narrow phase
+    // INTERNAL UnityPhysics interface for jobs that iterate through the list of contact manifolds produced by the narrow phase
+    // Important: Only use inside UnityPhysics code! Jobs in other projects should implement IContactsJob.
     [JobProducerType(typeof(IContactsJobExtensions.ContactsJobProcess<>))]
-    public interface IContactsJob
+    public interface IContactsJobBase
     {
         // Note, multiple contacts can share the same header, but will have a different ModifiableContactPoint.Index.
         void Execute(ref ModifiableContactHeader header, ref ModifiableContactPoint contact);
     }
+
+#if !HAVOK_PHYSICS_EXISTS
+
+    // Interface for jobs that iterate through the list of contact manifolds produced by the narrow phase
+    public interface IContactsJob : IContactsJobBase
+    {
+    }
+
+#endif
 
     public struct ModifiableContactHeader
     {
         internal ContactHeader ContactHeader;
         public bool Modified { get; private set; }
 
-        public EntityPair Entities { get; internal set; }
-        public BodyIndexPair BodyIndexPair => ContactHeader.BodyPair;
-        public CustomTagsPair BodyCustomTags => ContactHeader.BodyCustomTags;
-        public ColliderKeyPair ColliderKeys => ContactHeader.ColliderKeys;
+        internal EntityPair EntityPair;
+
+        public Entity EntityB => EntityPair.EntityB;
+        public Entity EntityA => EntityPair.EntityA;
+        public int BodyIndexB => ContactHeader.BodyPair.BodyIndexB;
+        public int BodyIndexA => ContactHeader.BodyPair.BodyIndexA;
+        public byte CustomTagsB => ContactHeader.BodyCustomTags.CustomTagsB;
+        public byte CustomTagsA => ContactHeader.BodyCustomTags.CustomTagsA;
+        public ColliderKey ColliderKeyB => ContactHeader.ColliderKeys.ColliderKeyB;
+        public ColliderKey ColliderKeyA => ContactHeader.ColliderKeys.ColliderKeyA;
+
         public int NumContacts => ContactHeader.NumContacts;
 
         public JacobianFlags JacobianFlags
@@ -67,12 +83,6 @@ namespace Unity.Physics
                 Modified = true;
             }
         }
-
-        #region Obsolete
-        [EditorBrowsable(EditorBrowsableState.Never)]
-        [Obsolete("BodyCustomDatas has been deprecated. Use BodyCustomTags instead. (RemovedAfter 2019-10-03)", true)]
-        public CustomDataPair BodyCustomDatas => throw new NotImplementedException();
-        #endregion
     }
 
     public struct ModifiableContactPoint
@@ -107,20 +117,27 @@ namespace Unity.Physics
     public static class IContactsJobExtensions
     {
 #if !HAVOK_PHYSICS_EXISTS
-        // Default IContactsJob.Schedule() implementation.
+        // Default Schedule() implementation for IContactsJob.
         public static unsafe JobHandle Schedule<T>(this T jobData, ISimulation simulation, ref PhysicsWorld world, JobHandle inputDeps)
-            where T : struct, IContactsJob
+            where T : struct, IContactsJobBase
         {
-            return ScheduleImpl(jobData, simulation, ref world, inputDeps);
+            // Should work only for UnityPhysics
+            if (simulation.Type != SimulationType.UnityPhysics)
+            {
+                return inputDeps;
+            }
+
+            return ScheduleUnityPhysicsContactsJob(jobData, simulation, ref world, inputDeps);
         }
+
 #else
-        // In this case IContactsJob.Schedule() is provided by the Havok.Physics assembly.
+        // In this case Schedule() implementation for IContactsJob is provided by the Havok.Physics assembly.
         // This is a stub to catch when that assembly is missing.
         //<todo.eoin.modifier Put in a link to documentation for this:
-        [Obsolete("This error occurs when HAVOK_PHYSICS_EXISTS is defined but Havok.Physics is missing from your package's asmdef references", true)]
+        [Obsolete("This error occurs when HAVOK_PHYSICS_EXISTS is defined but Havok.Physics is missing from your package's asmdef references. (DoNotRemove)", true)]
         public static unsafe JobHandle Schedule<T>(this T jobData, ISimulation simulation, ref PhysicsWorld world, JobHandle inputDeps,
             HAVOK_PHYSICS_MISSING_FROM_ASMDEF _causeCompileError = HAVOK_PHYSICS_MISSING_FROM_ASMDEF.HAVOK_PHYSICS_MISSING_FROM_ASMDEF)
-            where T : struct, IContactsJob
+            where T : struct, IContactsJobBase
         {
             return new JobHandle();
         }
@@ -131,37 +148,38 @@ namespace Unity.Physics
         }
 #endif
 
-        internal static unsafe JobHandle ScheduleImpl<T>(this T jobData, ISimulation simulation, ref PhysicsWorld world, JobHandle inputDeps)
-            where T : struct, IContactsJob
+        internal static unsafe JobHandle ScheduleUnityPhysicsContactsJob<T>(this T jobData, ISimulation simulation, ref PhysicsWorld world, JobHandle inputDeps)
+            where T : struct, IContactsJobBase
         {
-            if (simulation.Type == SimulationType.UnityPhysics)
+            SafetyChecks.CheckAreEqualAndThrow(SimulationType.UnityPhysics, simulation.Type);
+
+            var data = new ContactsJobData<T>
             {
-                var data = new ContactsJobData<T>
-                {
-                    UserJobData = jobData,
-                    ContactReader = ((Simulation)simulation).m_Context.Contacts,
-                    NumWorkItems = ((Simulation)simulation).m_Context.SolverSchedulerInfo.NumWorkItems,
-                    Bodies = world.Bodies
-                };
-                var parameters = new JobsUtility.JobScheduleParameters(
-                    UnsafeUtility.AddressOf(ref data),
-                    ContactsJobProcess<T>.Initialize(), inputDeps, ScheduleMode.Batched);
-                return JobsUtility.Schedule(ref parameters);
-            }
-            return inputDeps;
+                UserJobData = jobData,
+                ContactReader = ((Simulation)simulation).StepContext.Contacts.AsReader(),
+                NumWorkItems = ((Simulation)simulation).StepContext.SolverSchedulerInfo.NumWorkItems,
+                Bodies = world.Bodies
+            };
+            var parameters = new JobsUtility.JobScheduleParameters(
+#if UNITY_2020_2_OR_NEWER
+                UnsafeUtility.AddressOf(ref data), ContactsJobProcess<T>.Initialize(), inputDeps, ScheduleMode.Single);
+#else
+                UnsafeUtility.AddressOf(ref data), ContactsJobProcess<T>.Initialize(), inputDeps, ScheduleMode.Batched);
+#endif
+            return JobsUtility.Schedule(ref parameters);
         }
 
         internal unsafe struct ContactsJobData<T> where T : struct
         {
             public T UserJobData;
 
-            [NativeDisableContainerSafetyRestriction] public BlockStream.Reader ContactReader;
+            [NativeDisableContainerSafetyRestriction] public NativeStream.Reader ContactReader;
             [ReadOnly] public NativeArray<int> NumWorkItems;
-            // Disable aliasing restriction in case T has a NativeSlice of PhysicsWorld.Bodies
-            [ReadOnly, NativeDisableContainerSafetyRestriction] public NativeSlice<RigidBody> Bodies;
+            // Disable aliasing restriction in case T has a NativeArray of PhysicsWorld.Bodies
+            [ReadOnly, NativeDisableContainerSafetyRestriction] public NativeArray<RigidBody> Bodies;
         }
 
-        internal struct ContactsJobProcess<T> where T : struct, IContactsJob
+        internal struct ContactsJobProcess<T> where T : struct, IContactsJobBase
         {
             static IntPtr jobReflectionData;
 
@@ -169,8 +187,11 @@ namespace Unity.Physics
             {
                 if (jobReflectionData == IntPtr.Zero)
                 {
-                    jobReflectionData = JobsUtility.CreateJobReflectionData(typeof(ContactsJobData<T>),
-                        typeof(T), JobType.Single, (ExecuteJobFunction)Execute);
+#if UNITY_2020_2_OR_NEWER
+                    jobReflectionData = JobsUtility.CreateJobReflectionData(typeof(ContactsJobData<T>), typeof(T), (ExecuteJobFunction)Execute);
+#else
+                    jobReflectionData = JobsUtility.CreateJobReflectionData(typeof(ContactsJobData<T>), typeof(T), JobType.Single, (ExecuteJobFunction)Execute);
+#endif
                 }
                 return jobReflectionData;
             }
@@ -191,10 +212,10 @@ namespace Unity.Physics
                     var header = new ModifiableContactHeader
                     {
                         ContactHeader = *iterator.m_LastHeader,
-                        Entities = new EntityPair
+                        EntityPair = new EntityPair
                         {
-                            EntityA = jobData.Bodies[iterator.m_LastHeader->BodyPair.BodyAIndex].Entity,
-                            EntityB = jobData.Bodies[iterator.m_LastHeader->BodyPair.BodyBIndex].Entity
+                            EntityA = jobData.Bodies[iterator.m_LastHeader->BodyPair.BodyIndexA].Entity,
+                            EntityB = jobData.Bodies[iterator.m_LastHeader->BodyPair.BodyIndexB].Entity
                         }
                     };
                     var contact = new ModifiableContactPoint
@@ -221,14 +242,14 @@ namespace Unity.Physics
         // Utility to help iterate over all the items in the contacts job stream
         private unsafe struct ContactsJobIterator
         {
-            [NativeDisableContainerSafetyRestriction] BlockStream.Reader m_ContactReader;
+            [NativeDisableContainerSafetyRestriction] NativeStream.Reader m_ContactReader;
             [NativeDisableUnsafePtrRestriction] public ContactHeader* m_LastHeader;
             [NativeDisableUnsafePtrRestriction] public ContactPoint* m_LastContact;
             int m_NumPointsLeft;
             int m_CurrentWorkItem;
             readonly int m_MaxNumWorkItems;
 
-            public unsafe ContactsJobIterator(BlockStream.Reader reader, int numWorkItems)
+            public unsafe ContactsJobIterator(NativeStream.Reader reader, int numWorkItems)
             {
                 m_ContactReader = reader;
                 m_MaxNumWorkItems = numWorkItems;
@@ -254,12 +275,12 @@ namespace Unity.Physics
                     if (m_NumPointsLeft == 0)
                     {
                         // Need to get a new header
-                        m_LastHeader = (ContactHeader*)m_ContactReader.Read(sizeof(ContactHeader));
+                        m_LastHeader = (ContactHeader*)m_ContactReader.ReadUnsafePtr(sizeof(ContactHeader));
                         m_NumPointsLeft = m_LastHeader->NumContacts;
                         AdvanceForEachIndex();
                     }
 
-                    m_LastContact = (ContactPoint*)m_ContactReader.Read(sizeof(ContactPoint));
+                    m_LastContact = (ContactPoint*)m_ContactReader.ReadUnsafePtr(sizeof(ContactPoint));
                     m_NumPointsLeft--;
                     AdvanceForEachIndex();
                 }

@@ -1,4 +1,4 @@
-using System;
+using Unity.Burst;
 using Unity.Mathematics;
 
 namespace Unity.Physics
@@ -31,7 +31,7 @@ namespace Unity.Physics
     {
         #region AABB vs colliders
 
-        public static unsafe void AabbCollider<T>(OverlapAabbInput input, Collider* collider, ref T collector)
+        public static unsafe void AabbCollider<T>(OverlapAabbInput input, [NoAlias] Collider* collider, [NoAlias] ref T collector)
             where T : struct, IOverlapCollector
         {
             if (!CollisionFilter.IsCollisionEnabled(input.Filter, collider->Filter))
@@ -51,7 +51,8 @@ namespace Unity.Physics
                     AabbTerrain(input, (TerrainCollider*)collider, ref collector);
                     break;
                 default:
-                    throw new NotImplementedException();
+                    SafetyChecks.ThrowNotImplementedException();
+                    return;
             }
         }
 
@@ -72,15 +73,15 @@ namespace Unity.Physics
                 m_NumKeys = 0;
             }
 
-            public void AabbLeaf<T>(OverlapAabbInput input, int primitiveKey, ref T collector) where T : struct, IOverlapCollector
+            public void AabbLeaf<T>(OverlapAabbInput input, int primitiveKey, [NoAlias] ref T collector) where T : struct, IOverlapCollector
             {
                 fixed (uint* keys = m_Keys)
                 {
                     keys[m_NumKeys++] = new ColliderKey(m_NumColliderKeyBits, (uint)(primitiveKey << 1)).Value;
 
                     Mesh.PrimitiveFlags flags = m_Mesh->GetPrimitiveFlags(primitiveKey);
-                    if (Mesh.IsPrimitveFlagSet(flags, Mesh.PrimitiveFlags.IsTrianglePair) &&
-                        !Mesh.IsPrimitveFlagSet(flags, Mesh.PrimitiveFlags.IsQuad))
+                    if (Mesh.IsPrimitiveFlagSet(flags, Mesh.PrimitiveFlags.IsTrianglePair) &&
+                        !Mesh.IsPrimitiveFlagSet(flags, Mesh.PrimitiveFlags.IsQuad))
                     {
                         keys[m_NumKeys++] = new ColliderKey(m_NumColliderKeyBits, (uint)(primitiveKey << 1) | 1).Value;
                     }
@@ -93,7 +94,7 @@ namespace Unity.Physics
             }
 
             // Flush keys to collector
-            internal void Flush<T>(ref T collector) where T : struct, IOverlapCollector
+            internal void Flush<T>([NoAlias] ref T collector) where T : struct, IOverlapCollector
             {
                 fixed (uint* keys = m_Keys)
                 {
@@ -103,7 +104,7 @@ namespace Unity.Physics
             }
         }
 
-        private static unsafe void AabbMesh<T>(OverlapAabbInput input, MeshCollider* mesh, ref T collector)
+        private static unsafe void AabbMesh<T>(OverlapAabbInput input, [NoAlias] MeshCollider* mesh, [NoAlias] ref T collector)
             where T : struct, IOverlapCollector
         {
             var leafProcessor = new MeshLeafProcessor(mesh);
@@ -129,7 +130,7 @@ namespace Unity.Physics
                 m_NumKeys = 0;
             }
 
-            public void AabbLeaf<T>(OverlapAabbInput input, int childIndex, ref T collector) where T : struct, IOverlapCollector
+            public void AabbLeaf<T>(OverlapAabbInput input, int childIndex, [NoAlias] ref T collector) where T : struct, IOverlapCollector
             {
                 ColliderKey childKey = new ColliderKey(m_NumColliderKeyBits, (uint)(childIndex));
 
@@ -165,7 +166,7 @@ namespace Unity.Physics
             }
         }
 
-        private static unsafe void AabbCompound<T>(OverlapAabbInput input, CompoundCollider* compound, ref T collector)
+        private static unsafe void AabbCompound<T>(OverlapAabbInput input, [NoAlias] CompoundCollider* compound, [NoAlias] ref T collector)
             where T : struct, IOverlapCollector
         {
             var leafProcessor = new CompoundLeafProcessor(compound);
@@ -173,7 +174,7 @@ namespace Unity.Physics
             leafProcessor.Flush(ref collector);
         }
 
-        private static unsafe void AabbTerrain<T>(OverlapAabbInput input, TerrainCollider* terrainCollider, ref T collector)
+        private static unsafe void AabbTerrain<T>(OverlapAabbInput input, [NoAlias] TerrainCollider* terrainCollider, [NoAlias] ref T collector)
             where T : struct, IOverlapCollector
         {
             ref var terrain = ref terrainCollider->Terrain;

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
@@ -7,16 +7,20 @@ using Unity.Mathematics;
 using UnityEngine.Assertions;
 using Unity.Collections.LowLevel.Unsafe;
 using static Unity.Physics.Math;
+using Unity.Burst;
 
 namespace Unity.Physics
 {
     /// <summary>
     /// Convex hull builder.
     /// </summary>
+    [NoAlias]
     unsafe struct ConvexHullBuilder
     {
         // Mesh representation of the hull
+        [NoAlias]
         private ElementPoolBase m_Vertices;
+        [NoAlias]
         private ElementPoolBase m_Triangles;
 
         public unsafe ElementPool<Vertex> Vertices
@@ -682,7 +686,7 @@ namespace Unity.Physics
         }
 
         // Set the face index for each triangle. Triangles lying in the same plane will have the same face index.
-        public unsafe void BuildFaceIndices(NativeSlice<Plane>? planes = null)
+        public void BuildFaceIndices(NativeArray<Plane> planes = default)
         {
             const float convexEps = 1e-5f; // Maximum error allowed in face convexity
 
@@ -690,9 +694,9 @@ namespace Unity.Physics
             NumFaceVertices = 0;
 
             NativeArray<bool> planesUsed = new NativeArray<bool>();
-            if (planes != null)
+            if (planes.IsCreated)
             {
-                planesUsed = new NativeArray<bool>(planes.Value.Length, Allocator.Temp, NativeArrayOptions.ClearMemory);
+                planesUsed = new NativeArray<bool>(planes.Length, Allocator.Temp, NativeArrayOptions.ClearMemory);
             }
 
             switch (Dimension)
@@ -721,7 +725,7 @@ namespace Unity.Physics
                     // Sort the triangles by descending area. It is best to choose the face plane from the largest triangle
                     // because 1) it minimizes the distance to other triangles and therefore the plane error, and 2) it avoids numerical
                     // problems computing degenerate triangle normals
-                    new NativeSlice<int>(triangleIndices, 0, numTriangles).Sort(new CompareAreaDescending(triangleAreas));
+                    triangleIndices.GetSubArray(0, numTriangles).Sort(new CompareAreaDescending(triangleAreas));
 
                     // Clear faces
                     NativeArray<Edge> boundaryEdges = new NativeArray<Edge>(Triangles.PeakCount, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
@@ -753,10 +757,10 @@ namespace Unity.Physics
                             float3 a = Vertices[t.Vertex0].Position;
                             float3 b = Vertices[t.Vertex1].Position;
                             float3 c = Vertices[t.Vertex2].Position;
-                            for (int i = 0; i < planes.Value.Length; i++)
+                            for (int i = 0; i < planes.Length; i++)
                             {
                                 if (planesUsed[i]) continue;
-                                Plane currentPlane = planes.Value[i];
+                                Plane currentPlane = planes[i];
                                 float3 errors = new float3(currentPlane.SignedDistanceToPoint(a), currentPlane.SignedDistanceToPoint(b), currentPlane.SignedDistanceToPoint(c));
                                 float error = math.cmax(math.abs(errors));
                                 if (error < bestError)
@@ -776,7 +780,7 @@ namespace Unity.Physics
                         else
                         {
                             planesUsed[bestPlane] = true;
-                            plane = planes.Value[bestPlane];
+                            plane = planes[bestPlane];
                         }
                         Planes[newFaceIndex] = plane;
 
@@ -1309,7 +1313,7 @@ namespace Unity.Physics
                 }
 
                 // Collapse vertices in order of increasing cost
-                new NativeSlice<Collapse>(collapses, 0, numCollapses).Sort(new CollapseComparer());
+                collapses.GetSubArray(0, numCollapses).Sort(new CollapseComparer());
                 int numNewVertices = 0;
                 for (int i = 0; i < numCollapses; i++)
                 {
@@ -2110,7 +2114,7 @@ namespace Unity.Physics
             // from degenerate triangles.  This is fixed by another round of simplification with the error tolerance set low enough that the vertices
             // cannot move far enough to introduce new unintended faces.
             RemoveRedundantVertices();
-            BuildFaceIndices(new NativeSlice<Plane>(planes, 0, numPlanes));
+            BuildFaceIndices(planes.GetSubArray(0, numPlanes));
             SimplifyVertices(k_PlaneEps, maxVertices);
 
             // Snap coords to their quantized values for the last build
@@ -2121,7 +2125,7 @@ namespace Unity.Physics
                 Vertices.Set(v, vertex);
             }
 
-            BuildFaceIndices(new NativeSlice<Plane>(planes, 0, numPlanes));
+            BuildFaceIndices(planes.GetSubArray(0, numPlanes));
 
             return offset;
         }

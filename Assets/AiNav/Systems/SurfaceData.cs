@@ -119,7 +119,7 @@ namespace AiNav
             for (int i = 0; i < meshSources.Length; i++)
             {
                 var meshSource = meshSources[i];
-                meshSource.Value.Release();
+                meshSource.Value.Dispose();//.Release();
             }
             blobs.Dispose();
             infos.Dispose();

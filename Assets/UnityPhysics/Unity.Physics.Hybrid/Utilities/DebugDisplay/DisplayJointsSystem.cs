@@ -10,9 +10,11 @@ using static Unity.Physics.Math;
 
 namespace Unity.Physics.Authoring
 {
-    /// Creates DisplayJointsJobs
-    [UpdateAfter(typeof(BuildPhysicsWorld)), UpdateBefore(typeof(StepPhysicsWorld))]
-    public class DisplayJointsSystem : JobComponentSystem
+    // Creates DisplayJointsJobs
+    // Update before end frame system as well as some test systems might have disabled the step system
+    [UpdateInGroup(typeof(FixedStepSimulationSystemGroup))]
+    [UpdateAfter(typeof(BuildPhysicsWorld)), UpdateBefore(typeof(StepPhysicsWorld)), UpdateBefore(typeof(EndFramePhysicsSystem))]
+    public class DisplayJointsSystem : SystemBase
     {
         /// Job which draws every joint
         [BurstCompile]
@@ -21,26 +23,27 @@ namespace Unity.Physics.Authoring
             const float k_Scale = 0.5f;
 
             public DebugStream.Context OutputStream;
-            [ReadOnly] public NativeSlice<RigidBody> Bodies;
-            [ReadOnly] public NativeSlice<Joint> Joints;
+            [ReadOnly] public NativeArray<RigidBody> Bodies;
+            [ReadOnly] public NativeArray<Joint> Joints;
 
             public unsafe void Execute()
             {
                 // Color palette
-                Color colorA = Color.cyan;
-                Color colorB = Color.magenta;
-                Color colorError = Color.red;
-                Color colorRange = Color.yellow;
+                var colorA = Unity.DebugDisplay.ColorIndex.Cyan;
+                var colorB = Unity.DebugDisplay.ColorIndex.Magenta;
+                var colorError = Unity.DebugDisplay.ColorIndex.Red;
+                var colorRange = Unity.DebugDisplay.ColorIndex.Yellow;
 
                 OutputStream.Begin(0);
 
                 for (int iJoint = 0; iJoint < Joints.Length; iJoint++)
                 {
                     Joint joint = Joints[iJoint];
-                    JointData* jointData = joint.JointData;
 
-                    RigidBody bodyA = Bodies[joint.BodyPair.BodyAIndex];
-                    RigidBody bodyB = Bodies[joint.BodyPair.BodyBIndex];
+                    if (!joint.BodyPair.IsValid) continue;
+
+                    RigidBody bodyA = Bodies[joint.BodyPair.BodyIndexA];
+                    RigidBody bodyB = Bodies[joint.BodyPair.BodyIndexB];
 
                     MTransform worldFromA, worldFromB;
                     MTransform worldFromJointA, worldFromJointB;
@@ -48,17 +51,16 @@ namespace Unity.Physics.Authoring
                         worldFromA = new MTransform(bodyA.WorldFromBody);
                         worldFromB = new MTransform(bodyB.WorldFromBody);
 
-                        worldFromJointA = Mul(worldFromA, jointData->AFromJoint);
-                        worldFromJointB = Mul(worldFromB, jointData->BFromJoint);
+                        worldFromJointA = Mul(worldFromA, joint.AFromJoint);
+                        worldFromJointB = Mul(worldFromB, joint.BFromJoint);
                     }
 
                     float3 pivotA = worldFromJointA.Translation;
                     float3 pivotB = worldFromJointB.Translation;
 
-                    for (int iConstraint = 0; iConstraint < jointData->NumConstraints; iConstraint++)
+                    for (var i = 0; i < joint.Constraints.Length; i++)
                     {
-                        Constraint constraint = jointData->Constraints[iConstraint];
-
+                        Constraint constraint = joint.Constraints[i];
                         switch (constraint.Type)
                         {
                             case ConstraintType.Linear:
@@ -71,6 +73,8 @@ namespace Unity.Physics.Authoring
                                 float rangeDistance;
                                 switch (constraint.Dimension)
                                 {
+                                    case 0:
+                                        continue;
                                     case 1:
                                         float3 normal = worldFromJointB.Rotation[constraint.ConstrainedAxis1D];
                                         OutputStream.Plane(pivotB, normal * k_Scale, colorB);
@@ -94,7 +98,8 @@ namespace Unity.Physics.Authoring
                                         rangeDirection = math.select(diff / rangeDistance, float3.zero, rangeDistance < 1e-5);
                                         break;
                                     default:
-                                        throw new NotImplementedException();
+                                        SafetyChecks.ThrowNotImplementedException();
+                                        return;
                                 }
 
                                 // Draw the pivot on A
@@ -127,6 +132,8 @@ namespace Unity.Physics.Authoring
                             case ConstraintType.Angular:
                                 switch (constraint.Dimension)
                                 {
+                                    case 0:
+                                        continue;
                                     case 1:
                                         // Get the limited axis and perpendicular in joint space
                                         int constrainedAxis = constraint.ConstrainedAxis1D;
@@ -176,11 +183,13 @@ namespace Unity.Physics.Authoring
                                         // TODO - no idea how to visualize this if the limits are nonzero :)
                                         break;
                                     default:
-                                        throw new NotImplementedException();
+                                        SafetyChecks.ThrowNotImplementedException();
+                                        return;
                                 }
                                 break;
                             default:
-                                throw new NotImplementedException();
+                                SafetyChecks.ThrowNotImplementedException();
+                                return;
                         }
                     }
                 }
@@ -190,47 +199,42 @@ namespace Unity.Physics.Authoring
         }
 
         BuildPhysicsWorld m_BuildPhysicsWorldSystem;
+        StepPhysicsWorld m_StepPhysicsWorldSystem;
         EndFramePhysicsSystem m_EndFramePhysicsSystem;
         DebugStream m_DebugStreamSystem;
 
         protected override void OnCreate()
         {
             m_BuildPhysicsWorldSystem = World.GetOrCreateSystem<BuildPhysicsWorld>();
+            m_StepPhysicsWorldSystem = World.GetOrCreateSystem<StepPhysicsWorld>();
             m_EndFramePhysicsSystem = World.GetOrCreateSystem<EndFramePhysicsSystem>();
             m_DebugStreamSystem = World.GetOrCreateSystem<DebugStream>();
         }
 
-        protected override JobHandle OnUpdate(JobHandle inputDeps)
+        protected override void OnUpdate()
         {
             if (!(HasSingleton<PhysicsDebugDisplayData>() && GetSingleton<PhysicsDebugDisplayData>().DrawJoints != 0))
             {
-                return inputDeps;
+                return;
             }
 
-            inputDeps = JobHandle.CombineDependencies(inputDeps, m_BuildPhysicsWorldSystem.FinalJobHandle);
+            var handle = JobHandle.CombineDependencies(Dependency, m_BuildPhysicsWorldSystem.GetOutputDependency());
 
 #pragma warning disable 618
-            JobHandle handle = new DisplayJointsJob
+            handle = new DisplayJointsJob
             {
                 OutputStream = m_DebugStreamSystem.GetContext(1),
                 Bodies = m_BuildPhysicsWorldSystem.PhysicsWorld.Bodies,
                 Joints = m_BuildPhysicsWorldSystem.PhysicsWorld.Joints
-            }.Schedule(inputDeps);
+            }.Schedule(handle);
 #pragma warning restore 618
 
-            m_EndFramePhysicsSystem.HandlesToWaitFor.Add(handle);
+            m_StepPhysicsWorldSystem.AddInputDependency(handle);
 
-            return handle;
+            // Add dependency for end frame system as well as some test systems might have disabled the step system
+            m_EndFramePhysicsSystem.AddInputDependency(handle);
+
+            Dependency = handle;
         }
-    }
-
-    [Obsolete("DisplayJointsJob has been deprecated. Use DisplayJointsSystem.DisplayJointsJob instead. (RemovedAfter 2019-10-15)")]
-    public struct DisplayJointsJob : IJob
-    {
-        public DebugStream.Context OutputStream;
-        [ReadOnly] public NativeSlice<RigidBody> Bodies;
-        [ReadOnly] public NativeSlice<Joint> Joints;
-
-        public void Execute() { }
     }
 }

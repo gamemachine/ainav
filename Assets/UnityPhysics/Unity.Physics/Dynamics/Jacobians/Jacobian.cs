@@ -1,5 +1,5 @@
 ﻿using System;
-using System.ComponentModel;
+using Unity.Burst;
 using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
 using Unity.Mathematics;
@@ -34,11 +34,7 @@ namespace Unity.Physics
         // These flags apply only to contact Jacobians
         IsTrigger = 1 << 5,
         EnableCollisionEvents = 1 << 6,
-        EnableSurfaceVelocity = 1 << 7,
-
-        [EditorBrowsable(EditorBrowsableState.Never)]
-        [Obsolete("EnableMaxImpulse has been deprecated. (RemovedAfter 2019-10-15)", true)]
-        EnableEnableMaxImpulse = 0
+        EnableSurfaceVelocity = 1 << 7
     }
 
     // Jacobian header, first part of each Jacobian in the stream
@@ -67,7 +63,7 @@ namespace Unity.Physics
                 if (HasContactManifold)
                     AccessColliderKeys() = value;
                 else
-                    throw new NotSupportedException("Jacobian does not have collision events enabled");
+                    SafetyChecks.ThrowNotSupportedException("Jacobian does not have collision events enabled");
             }
         }
 
@@ -81,7 +77,7 @@ namespace Unity.Physics
                 if (HasMassFactors)
                     AccessMassFactors() = value;
                 else
-                    throw new NotSupportedException("Jacobian does not have mass factors enabled");
+                    SafetyChecks.ThrowNotSupportedException("Jacobian does not have mass factors enabled");
             }
         }
 
@@ -95,20 +91,22 @@ namespace Unity.Physics
                 if (HasSurfaceVelocity)
                     AccessSurfaceVelocity() = value;
                 else
-                    throw new NotSupportedException("Jacobian does not have surface velocity enabled");
+                    SafetyChecks.ThrowNotSupportedException("Jacobian does not have surface velocity enabled");
             }
         }
 
         // Solve the Jacobian
-        public void Solve(ref MotionVelocity velocityA, ref MotionVelocity velocityB, Solver.StepInput stepInput,
-            ref BlockStream.Writer collisionEventsWriter, ref BlockStream.Writer triggerEventsWriter)
+        public void Solve([NoAlias] ref MotionVelocity velocityA, [NoAlias] ref MotionVelocity velocityB, Solver.StepInput stepInput,
+            [NoAlias] ref NativeStream.Writer collisionEventsWriter, [NoAlias] ref NativeStream.Writer triggerEventsWriter, bool enableFrictionVelocitiesHeuristic,
+            Solver.MotionStabilizationInput motionStabilizationSolverInputA, Solver.MotionStabilizationInput motionStabilizationSolverInputB)
         {
             if (Enabled)
             {
                 switch (Type)
                 {
                     case JacobianType.Contact:
-                        AccessBaseJacobian<ContactJacobian>().Solve(ref this, ref velocityA, ref velocityB, stepInput, ref collisionEventsWriter);
+                        AccessBaseJacobian<ContactJacobian>().Solve(ref this, ref velocityA, ref velocityB, stepInput, ref collisionEventsWriter,
+                            enableFrictionVelocitiesHeuristic, motionStabilizationSolverInputA, motionStabilizationSolverInputB);
                         break;
                     case JacobianType.Trigger:
                         AccessBaseJacobian<TriggerJacobian>().Solve(ref this, ref velocityA, ref velocityB, stepInput, ref triggerEventsWriter);
@@ -126,7 +124,8 @@ namespace Unity.Physics
                         AccessBaseJacobian<AngularLimit3DJacobian>().Solve(ref velocityA, ref velocityB, stepInput.Timestep, stepInput.InvTimestep);
                         break;
                     default:
-                        throw new NotImplementedException();
+                        SafetyChecks.ThrowNotImplementedException();
+                        return;
                 }
             }
         }
@@ -147,6 +146,12 @@ namespace Unity.Physics
                 UnsafeUtility.SizeOf<ColliderKeyPair>() : 0;
         }
 
+        private static int SizeOfEntityPair(JacobianType type, JacobianFlags flags)
+        {
+            return (type == JacobianType.Contact && (flags & JacobianFlags.EnableCollisionEvents) != 0) ?
+                UnsafeUtility.SizeOf<EntityPair>() : 0;
+        }
+
         private static int SizeOfSurfaceVelocity(JacobianType type, JacobianFlags flags)
         {
             return (type == JacobianType.Contact && (flags & JacobianFlags.EnableSurfaceVelocity) != 0) ?
@@ -161,7 +166,7 @@ namespace Unity.Physics
 
         private static int SizeOfModifierData(JacobianType type, JacobianFlags flags)
         {
-            return SizeOfColliderKeys(type, flags) + SizeOfSurfaceVelocity(type, flags) +
+            return SizeOfColliderKeys(type, flags) + SizeOfEntityPair(type, flags) + SizeOfSurfaceVelocity(type, flags) +
                 SizeOfMassFactors(type, flags);
         }
 
@@ -188,7 +193,8 @@ namespace Unity.Physics
                 case JacobianType.AngularLimit3D:
                     return UnsafeUtility.SizeOf<AngularLimit3DJacobian>();
                 default:
-                    throw new NotImplementedException();
+                    SafetyChecks.ThrowNotImplementedException();
+                    return default;
             }
         }
 
@@ -197,7 +203,7 @@ namespace Unity.Physics
         {
             byte* ptr = (byte*)UnsafeUtility.AddressOf(ref this);
             ptr += UnsafeUtility.SizeOf<JacobianHeader>();
-            return ref UnsafeUtilityEx.AsRef<T>(ptr);
+            return ref UnsafeUtility.AsRef<T>(ptr);
         }
 
         public unsafe ref ColliderKeyPair AccessColliderKeys()
@@ -205,7 +211,15 @@ namespace Unity.Physics
             Assert.IsTrue((Flags & JacobianFlags.EnableCollisionEvents) != 0);
             byte* ptr = (byte*)UnsafeUtility.AddressOf(ref this);
             ptr += UnsafeUtility.SizeOf<JacobianHeader>() + SizeOfBaseJacobian(Type);
-            return ref UnsafeUtilityEx.AsRef<ColliderKeyPair>(ptr);
+            return ref UnsafeUtility.AsRef<ColliderKeyPair>(ptr);
+        }
+
+        public unsafe ref EntityPair AccessEntities()
+        {
+            Assert.IsTrue((Flags & JacobianFlags.EnableCollisionEvents) != 0);
+            byte* ptr = (byte*)UnsafeUtility.AddressOf(ref this);
+            ptr += UnsafeUtility.SizeOf<JacobianHeader>() + SizeOfBaseJacobian(Type) + SizeOfColliderKeys(Type, Flags);
+            return ref UnsafeUtility.AsRef<EntityPair>(ptr);
         }
 
         public unsafe ref SurfaceVelocity AccessSurfaceVelocity()
@@ -213,8 +227,8 @@ namespace Unity.Physics
             Assert.IsTrue((Flags & JacobianFlags.EnableSurfaceVelocity) != 0);
             byte* ptr = (byte*)UnsafeUtility.AddressOf(ref this);
             ptr += UnsafeUtility.SizeOf<JacobianHeader>() + SizeOfBaseJacobian(Type) +
-                SizeOfColliderKeys(Type, Flags);
-            return ref UnsafeUtilityEx.AsRef<SurfaceVelocity>(ptr);
+                SizeOfColliderKeys(Type, Flags) + SizeOfEntityPair(Type, Flags);
+            return ref UnsafeUtility.AsRef<SurfaceVelocity>(ptr);
         }
 
         public unsafe ref MassFactors AccessMassFactors()
@@ -222,8 +236,8 @@ namespace Unity.Physics
             Assert.IsTrue((Flags & JacobianFlags.EnableMassFactors) != 0);
             byte* ptr = (byte*)UnsafeUtility.AddressOf(ref this);
             ptr += UnsafeUtility.SizeOf<JacobianHeader>() + SizeOfBaseJacobian(Type) +
-                SizeOfColliderKeys(Type, Flags) + SizeOfSurfaceVelocity(Type, Flags);
-            return ref UnsafeUtilityEx.AsRef<MassFactors>(ptr);
+                SizeOfColliderKeys(Type, Flags) + SizeOfEntityPair(Type, Flags) + SizeOfSurfaceVelocity(Type, Flags);
+            return ref UnsafeUtility.AsRef<MassFactors>(ptr);
         }
 
         public unsafe ref ContactJacAngAndVelToReachCp AccessAngularJacobian(int pointIndex)
@@ -232,7 +246,7 @@ namespace Unity.Physics
             byte* ptr = (byte*)UnsafeUtility.AddressOf(ref this);
             ptr += UnsafeUtility.SizeOf<JacobianHeader>() + SizeOfBaseJacobian(Type) + SizeOfModifierData(Type, Flags) +
                 pointIndex * UnsafeUtility.SizeOf<ContactJacAngAndVelToReachCp>();
-            return ref UnsafeUtilityEx.AsRef<ContactJacAngAndVelToReachCp>(ptr);
+            return ref UnsafeUtility.AsRef<ContactJacAngAndVelToReachCp>(ptr);
         }
 
         public unsafe ref ContactPoint AccessContactPoint(int pointIndex)
@@ -244,7 +258,7 @@ namespace Unity.Physics
             ptr += UnsafeUtility.SizeOf<JacobianHeader>() + SizeOfBaseJacobian(Type) + SizeOfModifierData(Type, Flags) +
                 baseJac.BaseJacobian.NumContacts * UnsafeUtility.SizeOf<ContactJacAngAndVelToReachCp>() +
                 pointIndex * UnsafeUtility.SizeOf<ContactPoint>();
-            return ref UnsafeUtilityEx.AsRef<ContactPoint>(ptr);
+            return ref UnsafeUtility.AsRef<ContactPoint>(ptr);
         }
 
         #endregion
@@ -355,11 +369,11 @@ namespace Unity.Physics
 
         // Calculate the inverse effective mass of a linear jacobian
         public static float CalculateInvEffectiveMassDiag(
-            float3 angA, float4 invInertiaAndMassA,
-            float3 angB, float4 invInertiaAndMassB)
+            float3 angA, float3 invInertiaA, float invMassA,
+            float3 angB, float3 invInertiaB, float invMassB)
         {
-            float3 angularPart = angA * angA * invInertiaAndMassA.xyz + angB * angB * invInertiaAndMassB.xyz;
-            float linearPart = invInertiaAndMassA.w + invInertiaAndMassB.w;
+            float3 angularPart = angA * angA * invInertiaA + angB * angB * invInertiaB;
+            float linearPart = invMassA + invMassB;
             return (angularPart.x + angularPart.y) + (angularPart.z + linearPart);
         }
 
@@ -397,27 +411,12 @@ namespace Unity.Physics
     // Iterator (and modifier) for jacobians
     unsafe struct JacobianIterator
     {
-        BlockStream.Reader m_Reader;
-        int m_CurrentWorkItem;
-        readonly bool m_IterateAll;
-        readonly int m_MaxWorkItemIndex;
+        NativeStream.Reader m_Reader;
 
-        public JacobianIterator(BlockStream.Reader jacobianStreamReader, int workItemIndex, bool iterateAll = false)
+        public JacobianIterator(NativeStream.Reader jacobianStreamReader, int workItemIndex)
         {
             m_Reader = jacobianStreamReader;
-            m_IterateAll = iterateAll;
-            m_MaxWorkItemIndex = workItemIndex;
-
-            if (iterateAll)
-            {
-                m_CurrentWorkItem = 0;
-                MoveReaderToNextForEachIndex();
-            }
-            else
-            {
-                m_CurrentWorkItem = workItemIndex;
-                m_Reader.BeginForEachIndex(workItemIndex);
-            }
+            m_Reader.BeginForEachIndex(workItemIndex);
         }
 
         public bool HasJacobiansLeft()
@@ -425,35 +424,15 @@ namespace Unity.Physics
             return m_Reader.RemainingItemCount > 0;
         }
 
-        public ref JacobianHeader ReadJacobianHeader(out int readSize)
-        {
-            readSize = Read<int>();
-            return ref UnsafeUtilityEx.AsRef<JacobianHeader>(Read(readSize));
-        }
-
         public ref JacobianHeader ReadJacobianHeader()
         {
             int readSize = Read<int>();
-            return ref UnsafeUtilityEx.AsRef<JacobianHeader>(Read(readSize));
-        }
-
-        private void MoveReaderToNextForEachIndex()
-        {
-            while (m_Reader.RemainingItemCount == 0 && m_CurrentWorkItem < m_MaxWorkItemIndex)
-            {
-                m_Reader.BeginForEachIndex(m_CurrentWorkItem);
-                m_CurrentWorkItem++;
-            }
+            return ref UnsafeUtility.AsRef<JacobianHeader>(Read(readSize));
         }
 
         private byte* Read(int size)
         {
-            byte* dataPtr = m_Reader.Read(size);
-
-            if (m_IterateAll)
-            {
-                MoveReaderToNextForEachIndex();
-            }
+            byte* dataPtr = m_Reader.ReadUnsafePtr(size);
 
             return dataPtr;
         }
@@ -461,7 +440,7 @@ namespace Unity.Physics
         private ref T Read<T>() where T : struct
         {
             int size = UnsafeUtility.SizeOf<T>();
-            return ref UnsafeUtilityEx.AsRef<T>(Read(size));
+            return ref UnsafeUtility.AsRef<T>(Read(size));
         }
     }
 }

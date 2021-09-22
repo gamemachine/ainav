@@ -39,8 +39,8 @@ namespace AiNav
 
         public void GetCounts(out int sourcesCount, out int tileSourcesCount)
         {
-            sourcesCount = IdIndex.Length;
-            tileSourcesCount = TileSources.Length;
+            sourcesCount = IdIndex.Count();
+            tileSourcesCount = TileSources.Count();
         }
 
         public NativeList<MeshSource> GetSources(int2 tileCoord)

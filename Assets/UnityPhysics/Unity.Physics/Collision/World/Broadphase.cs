@@ -1,189 +1,296 @@
-﻿
 using System;
 using System.Runtime.CompilerServices;
 using Unity.Burst;
 using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
 using Unity.Jobs;
+using Unity.Jobs.LowLevel.Unsafe;
 using Unity.Mathematics;
 using UnityEngine.Assertions;
 using static Unity.Physics.BoundingVolumeHierarchy;
-using static Unity.Physics.Math;
-
 
 namespace Unity.Physics
 {
     // A bounding volume around a collection of rigid bodies
-    public struct Broadphase : IDisposable, ICloneable
+    [NoAlias]
+    internal struct Broadphase : IDisposable
     {
+        [NoAlias]
         private Tree m_StaticTree;  // The tree of static rigid bodies
+        [NoAlias]
         private Tree m_DynamicTree; // The tree of dynamic rigid bodies
-        private NativeArray<CollisionFilter> m_BodyFilters; // A copy of the rigid body's filters
 
         public Tree StaticTree => m_StaticTree;
         public Tree DynamicTree => m_DynamicTree;
-        public Aabb Domain => Aabb.Union(m_StaticTree.BoundingVolumeHierarchy.Domain, m_DynamicTree.BoundingVolumeHierarchy.Domain);
+        public Aabb Domain =>
+            Aabb.Union(m_StaticTree.BoundingVolumeHierarchy.Domain, m_DynamicTree.BoundingVolumeHierarchy.Domain);
 
-        public void Init()
+        public int NumStaticBodies => m_StaticTree.NumBodies;
+
+        public int NumDynamicBodies => m_DynamicTree.NumBodies;
+
+        public Broadphase(int numStaticBodies, int numDynamicBodies)
         {
-            m_StaticTree.Init();
-            m_DynamicTree.Init();
-            m_BodyFilters = new NativeArray<CollisionFilter>(0, Allocator.Persistent, NativeArrayOptions.ClearMemory);
+            m_StaticTree = new Tree(numStaticBodies);
+            m_DynamicTree = new Tree(numDynamicBodies);
+        }
+
+        internal Broadphase(Tree staticTree, Tree dynamicTree)
+        {
+            m_StaticTree = staticTree;
+            m_DynamicTree = dynamicTree;
+        }
+
+        public void Reset(int numStaticBodies, int numDynamicBodies)
+        {
+            m_StaticTree.Reset(numStaticBodies);
+            m_DynamicTree.Reset(numDynamicBodies);
         }
 
         public void Dispose()
         {
             m_StaticTree.Dispose();
             m_DynamicTree.Dispose();
-            if (m_BodyFilters.IsCreated)
-            {
-                m_BodyFilters.Dispose();
-            }
         }
 
-        public object Clone()
+        public Broadphase Clone()
         {
-            var clone = new Broadphase
+            return new Broadphase
             {
                 m_StaticTree = (Tree)m_StaticTree.Clone(),
-                m_DynamicTree = (Tree)m_DynamicTree.Clone(),
-                m_BodyFilters = new NativeArray<CollisionFilter>(m_BodyFilters.Length, Allocator.Persistent, NativeArrayOptions.UninitializedMemory)
+                m_DynamicTree = (Tree)m_DynamicTree.Clone()
             };
-            clone.m_BodyFilters.CopyFrom(m_BodyFilters);
-            return clone;
+        }
+
+        #region Build
+
+        /// <summary>
+        /// Build the broadphase based on the given world.
+        /// </summary>
+        public void Build(NativeArray<RigidBody> staticBodies, NativeArray<RigidBody> dynamicBodies,
+            NativeArray<MotionVelocity> motionVelocities, float collisionTolerance, float timeStep, float3 gravity, bool buildStaticTree = true)
+        {
+            float aabbMargin = collisionTolerance * 0.5f; // each body contributes half
+
+            if (buildStaticTree)
+            {
+                m_StaticTree.Reset(staticBodies.Length);
+                BuildStaticTree(staticBodies, aabbMargin);
+            }
+
+            m_DynamicTree.Reset(dynamicBodies.Length);
+            BuildDynamicTree(dynamicBodies, motionVelocities, gravity, timeStep, aabbMargin);
         }
 
         /// <summary>
-        /// Schedule building of the static layer in broadphase.
-        /// Note: If param staticLayerChangeInfo.HaveStaticBodiesChanged indicates static layer needs to be rebuilt,
-        /// than Adjust* jobs will early out and Build* jobs will be executed.
-        /// Otherwise if staticLayerChangeInfo indicates that rebuild is not required,
-        /// Adjust* jobs will be executed and Build* will early out in runtime.
-        /// </summary>        
-        public unsafe JobHandle ScheduleStaticTreeBuildJobs(
-            ref PhysicsWorld world, int numThreadsHint, ref StaticLayerChangeInfo staticLayerChangeInfo,
-            NativeArray<CollisionFilter> previousFrameBodyFilters, JobHandle inputDeps)
+        /// Build the static tree of the broadphase based on the given array of rigid bodies.
+        /// </summary>
+        public void BuildStaticTree(NativeArray<RigidBody> staticBodies, float aabbMargin)
         {
-            JobHandle handle = inputDeps;
+            Assert.AreEqual(staticBodies.Length, m_StaticTree.NumBodies);
 
-            m_StaticTree.NodeCount = world.NumStaticBodies + BoundingVolumeHierarchy.Constants.MaxNumTreeBranches;
-            int dynamicBodyDiffFromPreviousFrame = world.NumDynamicBodies - m_DynamicTree.BodyCount;
-
-            // Fix up the static tree.
-            JobHandle adjustBodyIndices = new AdjustBodyIndicesJob
+            if (staticBodies.Length == 0)
             {
-                StaticNodes = m_StaticTree.Nodes,
-                NumStaticNodes = m_StaticTree.Nodes.Length,
-                NumDynamicBodiesDiff = dynamicBodyDiffFromPreviousFrame,
-                HaveStaticBodiesChanged = staticLayerChangeInfo.HaveStaticBodiesChangedArray
-            }.Schedule(handle);
+                return;
+            }
 
-            // Fix up body filters for static bodies.
-            JobHandle adjustStaticBodyFilters = new AdjustStaticBodyFilters
+            // Read bodies
+            var aabbs = new NativeArray<Aabb>(staticBodies.Length, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
+            var points = new NativeArray<PointAndIndex>(staticBodies.Length, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
+            for (int i = 0; i < staticBodies.Length; i++)
             {
-                NumDynamicBodiesDiff = dynamicBodyDiffFromPreviousFrame,
-                PreviousFrameBodyFilters = previousFrameBodyFilters,
-                BodyFilters = m_BodyFilters,
-                NumStaticBodies = world.NumStaticBodies,
-                NumDynamicBodies = world.NumDynamicBodies,
-                HaveStaticBodiesChanged = staticLayerChangeInfo.HaveStaticBodiesChangedArray
-            }.Schedule(handle);
+                PrepareStaticBodyDataJob.ExecuteImpl(i, aabbMargin, staticBodies, aabbs, points, m_StaticTree.BodyFilters, m_StaticTree.RespondsToCollision);
+            }
 
-            handle = JobHandle.CombineDependencies(adjustBodyIndices, adjustStaticBodyFilters);
+            // Build tree
+            m_StaticTree.BoundingVolumeHierarchy.Build(points, aabbs, out int nodeCount);
 
-            var aabbs = new NativeArray<Aabb>(world.NumBodies, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
-            var lookup = new NativeArray<PointAndIndex>(world.NumStaticBodies, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
-
-            handle = new BuildStaticBodyDataJob
-            {
-                RigidBodies = world.StaticBodies,
-                Aabbs = aabbs,
-                FiltersOut = new NativeSlice<CollisionFilter>(m_BodyFilters, world.NumDynamicBodies, world.NumStaticBodies),
-                Lookup = lookup,
-                Offset = world.NumDynamicBodies,
-                AabbMargin = world.CollisionWorld.CollisionTolerance / 2.0f // each body contributes half,
-            }.ScheduleUnsafeIndex0(staticLayerChangeInfo.NumStaticBodiesArray, 32, handle);
-
-            return m_StaticTree.BoundingVolumeHierarchy.ScheduleBuildJobs(
-                lookup, aabbs, m_BodyFilters, staticLayerChangeInfo.HaveStaticBodiesChangedArray, numThreadsHint, handle,
-                m_StaticTree.NodeCount, m_StaticTree.Ranges, m_StaticTree.m_BranchCount);
+            // Build node filters
+            m_StaticTree.BoundingVolumeHierarchy.BuildCombinedCollisionFilter(m_StaticTree.BodyFilters, 1, nodeCount - 1);
         }
 
-        [BurstCompile]
-        internal struct DisposeArrayJob : IJob
+        /// <summary>
+        /// Build the dynamic tree of the broadphase based on the given array of rigid bodies and motions.
+        /// </summary>
+        public void BuildDynamicTree(NativeArray<RigidBody> dynamicBodies,
+            NativeArray<MotionVelocity> motionVelocities, float3 gravity, float timeStep, float aabbMargin)
         {
-            [DeallocateOnJobCompletion] public NativeArray<int> Array;
-            public void Execute() { }
-        }
+            Assert.AreEqual(dynamicBodies.Length, m_DynamicTree.NumBodies);
 
-        private JobHandle ScheduleDynamicTreeBuildJobs(ref PhysicsWorld world, float timeStep, float3 gravity, int numThreadsHint, JobHandle inputDeps)
-        {
-            JobHandle handle = inputDeps;
-            var aabbs = new NativeArray<Aabb>(world.NumBodies, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
-            var lookup = new NativeArray<PointAndIndex>(world.NumDynamicBodies, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
-            var shouldDoWork = new NativeArray<int>(1, Allocator.TempJob);
-            shouldDoWork[0] = 1;
-
-            handle = new BuildDynamicBodyDataJob
+            if (dynamicBodies.Length == 0)
             {
-                RigidBodies = world.DynamicBodies,
-                MotionVelocities = world.MotionVelocities,
-                MotionDatas = world.MotionDatas,
-                Aabbs = aabbs,
-                FiltersOut = new NativeSlice<CollisionFilter>(m_BodyFilters, 0, world.NumDynamicBodies),
-                Lookup = lookup,
-                AabbMargin = world.CollisionWorld.CollisionTolerance / 2.0f, // each body contributes half
-                TimeStep = timeStep,
-                Gravity = gravity
-            }.Schedule(world.NumDynamicBodies, 32, handle);
+                return;
+            }
 
-            m_DynamicTree.NodeCount = world.NumDynamicBodies + BoundingVolumeHierarchy.Constants.MaxNumTreeBranches;
+            // Read bodies
+            var aabbs = new NativeArray<Aabb>(dynamicBodies.Length, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
+            var points = new NativeArray<PointAndIndex>(dynamicBodies.Length, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
+            for (int i = 0; i < dynamicBodies.Length; i++)
+            {
+                PrepareDynamicBodyDataJob.ExecuteImpl(i, aabbMargin, gravity, timeStep, dynamicBodies, motionVelocities, aabbs, points,
+                    m_DynamicTree.BodyFilters, m_DynamicTree.RespondsToCollision);
+            }
 
-            handle = m_DynamicTree.BoundingVolumeHierarchy.ScheduleBuildJobs(
-                lookup, aabbs, m_BodyFilters, shouldDoWork, numThreadsHint, handle,
-                m_DynamicTree.NodeCount, m_DynamicTree.Ranges, m_DynamicTree.m_BranchCount);
+            // Build tree
+            m_DynamicTree.BoundingVolumeHierarchy.Build(points, aabbs, out int nodeCount);
 
-            return new DisposeArrayJob { Array = shouldDoWork }.Schedule(handle);
-        }
-
-        [Obsolete("Broadphase.ScheduleBuildJobs() has been deprecated. Use the new implementation that takes gravity instead. (RemovedAfter 2019-12-06)", true)]
-        public JobHandle ScheduleBuildJobs(ref PhysicsWorld world, float timeStep, int numThreadsHint, ref StaticLayerChangeInfo staticLayerChangeInfo, JobHandle inputDeps)
-        {
-            PhysicsStep stepComponent = PhysicsStep.Default;
-            return ScheduleBuildJobs(ref world, timeStep, stepComponent.Gravity, numThreadsHint, ref staticLayerChangeInfo, inputDeps);
+            // Build node filters
+            m_DynamicTree.BoundingVolumeHierarchy.BuildCombinedCollisionFilter(m_DynamicTree.BodyFilters, 1, nodeCount - 1);
         }
 
         /// <summary>
         /// Schedule a set of jobs to build the broadphase based on the given world.
-        /// </summary>       
-        public JobHandle ScheduleBuildJobs(ref PhysicsWorld world, float timeStep, float3 gravity, int numThreadsHint, ref StaticLayerChangeInfo staticLayerChangeInfo, JobHandle inputDeps)
+        /// </summary>
+        public JobHandle ScheduleBuildJobs(ref PhysicsWorld world, float timeStep, float3 gravity, NativeArray<int> buildStaticTree, JobHandle inputDeps, bool multiThreaded = true)
         {
-            var previousFrameBodyFilters = new NativeArray<CollisionFilter>(m_BodyFilters, Allocator.TempJob);
-
-            if (world.NumBodies > m_BodyFilters.Length)
+            if (!multiThreaded)
             {
-                m_BodyFilters.Dispose();
-                m_BodyFilters = new NativeArray<CollisionFilter>(world.NumBodies, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+                return new BuildBroadphaseJob
+                {
+                    StaticBodies = world.StaticBodies,
+                    DynamicBodies = world.DynamicBodies,
+                    MotionVelocities = world.MotionVelocities,
+                    CollisionTolerance = world.CollisionWorld.CollisionTolerance,
+                    TimeStep = timeStep,
+                    Gravity = gravity,
+                    BuildStaticTree = buildStaticTree,
+                    Broadphase = this
+                }.Schedule(inputDeps);
             }
-
-            m_StaticTree.BodyCount = world.NumStaticBodies;
-            JobHandle staticTree = ScheduleStaticTreeBuildJobs(ref world, numThreadsHint, ref staticLayerChangeInfo, previousFrameBodyFilters, inputDeps);
-
-            m_DynamicTree.BodyCount = world.NumDynamicBodies;
-            JobHandle dynamicTree = inputDeps;
-            if (world.NumDynamicBodies > 0)
+            else
             {
-                dynamicTree = ScheduleDynamicTreeBuildJobs(ref world, timeStep, gravity, numThreadsHint, inputDeps);
+                // +1 for main thread
+                int threadCount = JobsUtility.JobWorkerCount + 1;
+                return JobHandle.CombineDependencies(
+                    ScheduleStaticTreeBuildJobs(ref world, threadCount, buildStaticTree, inputDeps),
+                    ScheduleDynamicTreeBuildJobs(ref world, timeStep, gravity, threadCount, inputDeps));
             }
-
-            return JobHandle.CombineDependencies(staticTree, dynamicTree);
         }
 
+        /// <summary>
+        /// Schedule a set of jobs to build the static tree of the broadphase based on the given world.
+        /// </summary>
+        public JobHandle ScheduleStaticTreeBuildJobs(
+            ref PhysicsWorld world, int numThreadsHint, NativeArray<int> shouldDoWork, JobHandle inputDeps)
+        {
+            Assert.AreEqual(world.NumStaticBodies, m_StaticTree.NumBodies);
+            if (world.NumStaticBodies == 0)
+            {
+                return inputDeps;
+            }
+
+            var aabbs = new NativeArray<Aabb>(world.NumStaticBodies, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
+            var points = new NativeArray<PointAndIndex>(world.NumStaticBodies, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
+
+            var numStaticBodiesArray = new NativeArray<int>(1, Allocator.TempJob);
+            JobHandle handle = new PrepareNumStaticBodiesJob
+            {
+                NumStaticBodies = world.NumStaticBodies,
+                BuildStaticTree = shouldDoWork,
+                NumStaticBodiesArray = numStaticBodiesArray
+            }.Schedule(inputDeps);
+
+            handle = new PrepareStaticBodyDataJob
+            {
+                RigidBodies = world.StaticBodies,
+                Aabbs = aabbs,
+                Points = points,
+                FiltersOut = m_StaticTree.BodyFilters,
+                RespondsToCollisionOut = m_StaticTree.RespondsToCollision,
+                AabbMargin = world.CollisionWorld.CollisionTolerance * 0.5f, // each body contributes half
+            }.ScheduleUnsafeIndex0(numStaticBodiesArray, 32, handle);
+
+            var buildHandle = m_StaticTree.BoundingVolumeHierarchy.ScheduleBuildJobs(
+                points, aabbs, m_StaticTree.BodyFilters, shouldDoWork, numThreadsHint, handle,
+                m_StaticTree.Nodes.Length, m_StaticTree.Ranges, m_StaticTree.BranchCount);
+
+            return JobHandle.CombineDependencies(buildHandle, numStaticBodiesArray.Dispose(handle));
+        }
+
+        /// <summary>
+        /// Schedule a set of jobs to build the dynamic tree of the broadphase based on the given world.
+        /// </summary>
+        public JobHandle ScheduleDynamicTreeBuildJobs(
+            ref PhysicsWorld world, float timeStep, float3 gravity, int numThreadsHint, JobHandle inputDeps)
+        {
+            Assert.AreEqual(world.NumDynamicBodies, m_DynamicTree.NumBodies);
+            if (world.NumDynamicBodies == 0)
+            {
+                return inputDeps;
+            }
+
+            var aabbs = new NativeArray<Aabb>(world.NumDynamicBodies, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
+            var points = new NativeArray<PointAndIndex>(world.NumDynamicBodies, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
+
+            JobHandle handle = new PrepareDynamicBodyDataJob
+            {
+                RigidBodies = world.DynamicBodies,
+                MotionVelocities = world.MotionVelocities,
+                Aabbs = aabbs,
+                Points = points,
+                FiltersOut = m_DynamicTree.BodyFilters,
+                RespondsToCollisionOut = m_DynamicTree.RespondsToCollision,
+                AabbMargin = world.CollisionWorld.CollisionTolerance * 0.5f, // each body contributes half
+                TimeStep = timeStep,
+                Gravity = gravity
+            }.Schedule(world.NumDynamicBodies, 32, inputDeps);
+
+            var shouldDoWork = new NativeArray<int>(1, Allocator.TempJob);
+            shouldDoWork[0] = 1;
+
+            handle = m_DynamicTree.BoundingVolumeHierarchy.ScheduleBuildJobs(
+                points, aabbs, m_DynamicTree.BodyFilters, shouldDoWork, numThreadsHint, handle,
+                m_DynamicTree.Nodes.Length, m_DynamicTree.Ranges, m_DynamicTree.BranchCount);
+
+            return shouldDoWork.Dispose(handle);
+        }
+
+        #endregion
+
+        #region Find overlaps
+
+        // Write all overlapping body pairs to the given streams,
+        // where at least one of the bodies is dynamic. The results are unsorted.
+        public void FindOverlaps(ref NativeStream.Writer dynamicVsDynamicPairsWriter, ref NativeStream.Writer staticVsDynamicPairsWriter)
+        {
+            // Dynamic-dynamic
+            {
+                dynamicVsDynamicPairsWriter.BeginForEachIndex(0);
+                DynamicVsDynamicFindOverlappingPairsJob.ExecuteImpl(
+                    new int2(1, 1), m_DynamicTree, ref dynamicVsDynamicPairsWriter);
+                dynamicVsDynamicPairsWriter.EndForEachIndex();
+            }
+
+            // Static-dynamic
+            {
+                staticVsDynamicPairsWriter.BeginForEachIndex(0);
+                StaticVsDynamicFindOverlappingPairsJob.ExecuteImpl(
+                    new int2(1, 1), m_StaticTree, m_DynamicTree, ref staticVsDynamicPairsWriter);
+                staticVsDynamicPairsWriter.EndForEachIndex();
+            }
+        }
 
         // Schedule a set of jobs which will write all overlapping body pairs to the given steam,
         // where at least one of the bodies is dynamic. The results are unsorted.
-        internal JobHandle ScheduleFindOverlapsJobs(out BlockStream dynamicVsDynamicPairsStream, out BlockStream staticVsDynamicPairsStream, ref Simulation.Context context, JobHandle inputDeps)
+        public SimulationJobHandles ScheduleFindOverlapsJobs(out NativeStream dynamicVsDynamicPairsStream, out NativeStream staticVsDynamicPairsStream,
+            JobHandle inputDeps, bool multiThreaded = true)
         {
+            SimulationJobHandles returnHandles = default;
+
+            if (!multiThreaded)
+            {
+                dynamicVsDynamicPairsStream = new NativeStream(1, Allocator.TempJob);
+                staticVsDynamicPairsStream = new NativeStream(1, Allocator.TempJob);
+                returnHandles.FinalExecutionHandle = new FindOverlapsJob
+                {
+                    Broadphase = this,
+                    DynamicVsDynamicPairsWriter = dynamicVsDynamicPairsStream.AsWriter(),
+                    StaticVsDynamicPairsWriter = staticVsDynamicPairsStream.AsWriter()
+                }.Schedule(inputDeps);
+
+                return returnHandles;
+            }
+
             var dynamicVsDynamicNodePairIndices = new NativeList<int2>(Allocator.TempJob);
             var staticVsDynamicNodePairIndices = new NativeList<int2>(Allocator.TempJob);
 
@@ -191,15 +298,15 @@ namespace Unity.Physics
             {
                 dynamicVsDynamicNodePairIndices = dynamicVsDynamicNodePairIndices,
                 staticVsDynamicNodePairIndices = staticVsDynamicNodePairIndices,
-                dynamicBranchCount = m_DynamicTree.m_BranchCount,
-                staticBranchCount = m_StaticTree.m_BranchCount
+                dynamicBranchCount = m_DynamicTree.BranchCount,
+                staticBranchCount = m_StaticTree.BranchCount
             }.Schedule(inputDeps);
 
             // Build pairs of branch node indices
             JobHandle dynamicVsDynamicPairs = new DynamicVsDynamicBuildBranchNodePairsJob
             {
                 Ranges = m_DynamicTree.Ranges,
-                NumBranches = m_DynamicTree.m_BranchCount,
+                NumBranches = m_DynamicTree.BranchCount,
                 NodePairIndices = dynamicVsDynamicNodePairIndices.AsDeferredJobArray()
             }.Schedule(allocateDeps);
 
@@ -207,108 +314,131 @@ namespace Unity.Physics
             {
                 DynamicRanges = m_DynamicTree.Ranges,
                 StaticRanges = m_StaticTree.Ranges,
-                NumStaticBranches = m_StaticTree.m_BranchCount,
-                NumDynamicBranches = m_DynamicTree.m_BranchCount,
+                NumStaticBranches = m_StaticTree.BranchCount,
+                NumDynamicBranches = m_DynamicTree.BranchCount,
                 NodePairIndices = staticVsDynamicNodePairIndices.AsDeferredJobArray()
             }.Schedule(allocateDeps);
 
             //@TODO: We only need a dependency on allocateDeps, but the safety system doesn't understand that we can not change length list in DynamicVsDynamicBuildBranchNodePairsJob & StaticVsDynamicBuildBranchNodePairsJob
-            //       if this is a performance issue we can use [NativeDisableContainerSafetyRestriction] on DynamicVsDynamicBuildBranchNodePairsJob & StaticVsDynamicBuildBranchNodePairsJob 
-            JobHandle dynamicConstruct = BlockStream.ScheduleConstruct(out dynamicVsDynamicPairsStream, dynamicVsDynamicNodePairIndices, 0x0a542b34, dynamicVsDynamicPairs);
-            JobHandle staticConstruct = BlockStream.ScheduleConstruct(out staticVsDynamicPairsStream, staticVsDynamicNodePairIndices, 0x0a542666, staticVsDynamicPairs);
+            //       if this is a performance issue we can use [NativeDisableContainerSafetyRestriction] on DynamicVsDynamicBuildBranchNodePairsJob & StaticVsDynamicBuildBranchNodePairsJob
+            JobHandle dynamicConstruct = NativeStream.ScheduleConstruct(out dynamicVsDynamicPairsStream, dynamicVsDynamicNodePairIndices, dynamicVsDynamicPairs, Allocator.TempJob);
+            JobHandle staticConstruct = NativeStream.ScheduleConstruct(out staticVsDynamicPairsStream, staticVsDynamicNodePairIndices, staticVsDynamicPairs, Allocator.TempJob);
 
             // Write all overlaps to the stream (also deallocates nodePairIndices)
             JobHandle dynamicVsDynamicHandle = new DynamicVsDynamicFindOverlappingPairsJob
             {
-                DynamicNodes = m_DynamicTree.Nodes,
-                BodyFilters = m_BodyFilters,
-                DynamicNodeFilters = m_DynamicTree.NodeFilters,
-                PairWriter = dynamicVsDynamicPairsStream,
+                DynamicTree = m_DynamicTree,
+                PairWriter = dynamicVsDynamicPairsStream.AsWriter(),
                 NodePairIndices = dynamicVsDynamicNodePairIndices.AsDeferredJobArray()
             }.Schedule(dynamicVsDynamicNodePairIndices, 1, JobHandle.CombineDependencies(dynamicVsDynamicPairs, dynamicConstruct));
 
             // Write all overlaps to the stream (also deallocates nodePairIndices)
             JobHandle staticVsDynamicHandle = new StaticVsDynamicFindOverlappingPairsJob
             {
-                StaticNodes = m_StaticTree.Nodes,
-                DynamicNodes = m_DynamicTree.Nodes,
-                BodyFilters = m_BodyFilters,
-                StaticNodeFilters = m_StaticTree.NodeFilters,
-                DynamicNodeFilters = m_DynamicTree.NodeFilters,
-                PairWriter = staticVsDynamicPairsStream,
+                StaticTree = m_StaticTree,
+                DynamicTree = m_DynamicTree,
+                PairWriter = staticVsDynamicPairsStream.AsWriter(),
                 NodePairIndices = staticVsDynamicNodePairIndices.AsDeferredJobArray()
             }.Schedule(staticVsDynamicNodePairIndices, 1, JobHandle.CombineDependencies(staticVsDynamicPairs, staticConstruct));
 
             // Dispose node pair lists
-            context.DisposeOverlapPairs0 = NativeListUtilityTemp.DisposeHotFix(ref dynamicVsDynamicNodePairIndices, dynamicVsDynamicHandle);
-            context.DisposeOverlapPairs1 = NativeListUtilityTemp.DisposeHotFix(ref staticVsDynamicNodePairIndices, staticVsDynamicHandle);
+            var disposeOverlapPairs0 = dynamicVsDynamicNodePairIndices.Dispose(dynamicVsDynamicHandle);
+            var disposeOverlapPairs1 = staticVsDynamicNodePairIndices.Dispose(staticVsDynamicHandle);
+            returnHandles.FinalDisposeHandle = JobHandle.CombineDependencies(disposeOverlapPairs0, disposeOverlapPairs1);
+            returnHandles.FinalExecutionHandle = JobHandle.CombineDependencies(dynamicVsDynamicHandle, staticVsDynamicHandle);
 
-            return JobHandle.CombineDependencies(dynamicVsDynamicHandle, staticVsDynamicHandle);
+            return returnHandles;
         }
+
+        #endregion
 
         #region Tree
 
         // A tree of rigid bodies
-        public struct Tree : IDisposable, ICloneable
+        [NoAlias]
+        public struct Tree : IDisposable
         {
-            public NativeArray<Node> Nodes; // The nodes of the bounding volume
-            public NativeArray<CollisionFilter> NodeFilters;        // The collision filter for each node (a union of all its children)
-            public NativeArray<Builder.Range> Ranges;
-            public int BodyCount;
-            internal NativeArray<int> m_BranchCount;
+            [NoAlias] public NativeArray<Node> Nodes; // The nodes of the bounding volume
+            [NoAlias] public NativeArray<CollisionFilter> NodeFilters; // The collision filter for each node (a union of all its children)
+            [NoAlias] public NativeArray<CollisionFilter> BodyFilters; // A copy of the collision filter of each body
+            [NoAlias] public NativeArray<bool> RespondsToCollision; // A copy of the RespondsToCollision flag of each body
+            [NoAlias] internal NativeArray<Builder.Range> Ranges; // Used during building
+            [NoAlias] internal NativeArray<int> BranchCount; // Used during building
+            internal Allocator Allocator;
 
             public BoundingVolumeHierarchy BoundingVolumeHierarchy => new BoundingVolumeHierarchy(Nodes, NodeFilters);
 
-            public int NodeCount
+            public int NumBodies => BodyFilters.Length;
+
+            public Tree(int numBodies, Allocator allocator = Allocator.Persistent)
             {
-                get => Nodes.Length;
-                set
+                this = default;
+                Allocator = allocator;
+                SetCapacity(numBodies);
+                Ranges = new NativeArray<BoundingVolumeHierarchy.Builder.Range>(
+                    BoundingVolumeHierarchy.Constants.MaxNumTreeBranches, allocator, NativeArrayOptions.UninitializedMemory);
+                BranchCount = new NativeArray<int>(1, allocator, NativeArrayOptions.ClearMemory);
+            }
+
+            public void Reset(int numBodies)
+            {
+                if (numBodies != BodyFilters.Length)
                 {
-                    if (value != Nodes.Length)
-                    {
-                        Nodes.Dispose();
-                        Nodes = new NativeArray<BoundingVolumeHierarchy.Node>(value, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
-                        NodeFilters.Dispose();
-                        NodeFilters = new NativeArray<CollisionFilter>(value, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
-                    }
+                    SetCapacity(numBodies);
                 }
             }
 
-            public int BranchCount { get => m_BranchCount[0]; set => m_BranchCount[0] = value; }
-
-            public void Init()
+            private void SetCapacity(int numBodies)
             {
-                // Need minimum of 2 empty nodes, to gracefully return from queries on an empty tree
-                Nodes = new NativeArray<BoundingVolumeHierarchy.Node>(2, Allocator.Persistent, NativeArrayOptions.ClearMemory)
+                int numNodes = numBodies + BoundingVolumeHierarchy.Constants.MaxNumTreeBranches;
+
+                if (Nodes.IsCreated)
                 {
+                    Nodes.Dispose();
+                }
+                Nodes = new NativeArray<BoundingVolumeHierarchy.Node>(numNodes, Allocator, NativeArrayOptions.UninitializedMemory)
+                {
+                    // Always initialize first 2 nodes as empty, to gracefully return from queries on an empty tree
                     [0] = BoundingVolumeHierarchy.Node.Empty,
                     [1] = BoundingVolumeHierarchy.Node.Empty
                 };
-                NodeFilters = new NativeArray<CollisionFilter>(2, Allocator.Persistent, NativeArrayOptions.ClearMemory)
+
+                if (NodeFilters.IsCreated)
                 {
+                    NodeFilters.Dispose();
+                }
+                NodeFilters = new NativeArray<CollisionFilter>(numNodes, Allocator, NativeArrayOptions.UninitializedMemory)
+                {
+                    // All queries should descend past these special root nodes
                     [0] = CollisionFilter.Default,
                     [1] = CollisionFilter.Default
                 };
-                Ranges = new NativeArray<BoundingVolumeHierarchy.Builder.Range>(
-                    BoundingVolumeHierarchy.Constants.MaxNumTreeBranches, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
 
-                m_BranchCount = new NativeArray<int>(1, Allocator.Persistent, NativeArrayOptions.ClearMemory);
-                BodyCount = 0;
+                if (BodyFilters.IsCreated)
+                {
+                    BodyFilters.Dispose();
+                }
+                BodyFilters = new NativeArray<CollisionFilter>(numBodies, Allocator, NativeArrayOptions.UninitializedMemory);
+
+                if (RespondsToCollision.IsCreated)
+                {
+                    RespondsToCollision.Dispose();
+                }
+                RespondsToCollision = new NativeArray<bool>(numBodies, Allocator, NativeArrayOptions.UninitializedMemory);
             }
 
-            public object Clone()
+            public Tree Clone()
             {
-                var clone = new Tree();
-                clone.Nodes = new NativeArray<BoundingVolumeHierarchy.Node>(Nodes.Length, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
-                clone.Nodes.CopyFrom(Nodes);
-                clone.NodeFilters = new NativeArray<CollisionFilter>(NodeFilters.Length, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
-                clone.NodeFilters.CopyFrom(NodeFilters);
-                clone.Ranges = new NativeArray<BoundingVolumeHierarchy.Builder.Range>(Ranges.Length, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
-                clone.Ranges.CopyFrom(Ranges);
-                clone.m_BranchCount = new NativeArray<int>(1, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
-                clone.BranchCount = BranchCount;
-                clone.BodyCount = BodyCount;
-                return clone;
+                return new Tree
+                {
+                    Allocator = Allocator,
+                    Nodes = new NativeArray<BoundingVolumeHierarchy.Node>(Nodes, Allocator),
+                    NodeFilters = new NativeArray<CollisionFilter>(NodeFilters, Allocator),
+                    BodyFilters = new NativeArray<CollisionFilter>(BodyFilters, Allocator),
+                    RespondsToCollision = new NativeArray<bool>(RespondsToCollision, Allocator),
+                    Ranges = new NativeArray<BoundingVolumeHierarchy.Builder.Range>(Ranges, Allocator),
+                    BranchCount = new NativeArray<int>(BranchCount, Allocator)
+                };
             }
 
             public void Dispose()
@@ -323,14 +453,24 @@ namespace Unity.Physics
                     NodeFilters.Dispose();
                 }
 
+                if (BodyFilters.IsCreated)
+                {
+                    BodyFilters.Dispose();
+                }
+
+                if (RespondsToCollision.IsCreated)
+                {
+                    RespondsToCollision.Dispose();
+                }
+
                 if (Ranges.IsCreated)
                 {
                     Ranges.Dispose();
                 }
 
-                if (m_BranchCount.IsCreated)
+                if (BranchCount.IsCreated)
                 {
-                    m_BranchCount.Dispose();
+                    BranchCount.Dispose();
                 }
             }
         }
@@ -348,209 +488,174 @@ namespace Unity.Physics
                 RigidBodyIndices.AddRange(indices, count);
             }
 
-            public unsafe void AddColliderKeys(ColliderKey* keys, int count)
-            {
-                throw new NotSupportedException();
-            }
+            public unsafe void AddColliderKeys(ColliderKey* keys, int count) => SafetyChecks.ThrowNotSupportedException();
 
-            public void PushCompositeCollider(ColliderKeyPath compositeKey)
-            {
-                throw new NotSupportedException();
-            }
+            public void PushCompositeCollider(ColliderKeyPath compositeKey) => SafetyChecks.ThrowNotSupportedException();
 
-            public void PopCompositeCollider(uint numCompositeKeyBits)
-            {
-                throw new NotSupportedException();
-            }
+            public void PopCompositeCollider(uint numCompositeKeyBits) => SafetyChecks.ThrowNotSupportedException();
         }
 
         // Test broadphase nodes against the aabb in input. For any overlapping
         // tree leaves, put the body indices into the output leafIndices.
-        public void OverlapAabb(OverlapAabbInput input, NativeSlice<RigidBody> rigidBodies, ref NativeList<int> rigidBodyIndices)
+        public void OverlapAabb(OverlapAabbInput input, NativeArray<RigidBody> rigidBodies, ref NativeList<int> rigidBodyIndices)
         {
-            Assert.IsTrue(input.Filter.IsValid);
+            if (input.Filter.IsEmpty)
+                return;
             var leafProcessor = new BvhLeafProcessor(rigidBodies);
             var leafCollector = new RigidBodyOverlapsCollector { RigidBodyIndices = rigidBodyIndices };
+
+            leafProcessor.BaseRigidBodyIndex = m_DynamicTree.NumBodies;
             m_StaticTree.BoundingVolumeHierarchy.AabbOverlap(input, ref leafProcessor, ref leafCollector);
+
+            leafProcessor.BaseRigidBodyIndex = 0;
             m_DynamicTree.BoundingVolumeHierarchy.AabbOverlap(input, ref leafProcessor, ref leafCollector);
         }
 
-        public bool CastRay<T>(RaycastInput input, NativeSlice<RigidBody> rigidBodies, ref T collector)
+        public bool CastRay<T>(RaycastInput input, NativeArray<RigidBody> rigidBodies, ref T collector)
             where T : struct, ICollector<RaycastHit>
         {
-            Assert.IsTrue(input.Filter.IsValid);
+            if (input.Filter.IsEmpty)
+                return false;
             var leafProcessor = new BvhLeafProcessor(rigidBodies);
+
+            leafProcessor.BaseRigidBodyIndex = m_DynamicTree.NumBodies;
             bool hasHit = m_StaticTree.BoundingVolumeHierarchy.Raycast(input, ref leafProcessor, ref collector);
+
+            leafProcessor.BaseRigidBodyIndex = 0;
             hasHit |= m_DynamicTree.BoundingVolumeHierarchy.Raycast(input, ref leafProcessor, ref collector);
+
             return hasHit;
         }
 
-        public unsafe bool CastCollider<T>(ColliderCastInput input, NativeSlice<RigidBody> rigidBodies, ref T collector)
+        public unsafe bool CastCollider<T>(ColliderCastInput input, NativeArray<RigidBody> rigidBodies, ref T collector)
             where T : struct, ICollector<ColliderCastHit>
         {
-            Assert.IsTrue(input.Collider != null && input.Collider->Filter.IsValid);
+            Assert.IsTrue(input.Collider != null);
+            if (input.Collider->Filter.IsEmpty)
+                return false;
             var leafProcessor = new BvhLeafProcessor(rigidBodies);
+
+            leafProcessor.BaseRigidBodyIndex = m_DynamicTree.NumBodies;
             bool hasHit = m_StaticTree.BoundingVolumeHierarchy.ColliderCast(input, ref leafProcessor, ref collector);
+
+            leafProcessor.BaseRigidBodyIndex = 0;
             hasHit |= m_DynamicTree.BoundingVolumeHierarchy.ColliderCast(input, ref leafProcessor, ref collector);
+
             return hasHit;
         }
 
-        public bool CalculateDistance<T>(PointDistanceInput input, NativeSlice<RigidBody> rigidBodies, ref T collector)
+        public bool CalculateDistance<T>(PointDistanceInput input, NativeArray<RigidBody> rigidBodies, ref T collector)
             where T : struct, ICollector<DistanceHit>
         {
-            Assert.IsTrue(input.Filter.IsValid);
+            if (input.Filter.IsEmpty)
+                return false;
             var leafProcessor = new BvhLeafProcessor(rigidBodies);
+
+            leafProcessor.BaseRigidBodyIndex = m_DynamicTree.NumBodies;
             bool hasHit = m_StaticTree.BoundingVolumeHierarchy.Distance(input, ref leafProcessor, ref collector);
+
+            leafProcessor.BaseRigidBodyIndex = 0;
             hasHit |= m_DynamicTree.BoundingVolumeHierarchy.Distance(input, ref leafProcessor, ref collector);
+
             return hasHit;
         }
 
-        public unsafe bool CalculateDistance<T>(ColliderDistanceInput input, NativeSlice<RigidBody> rigidBodies, ref T collector)
+        public unsafe bool CalculateDistance<T>(ColliderDistanceInput input, NativeArray<RigidBody> rigidBodies, ref T collector)
             where T : struct, ICollector<DistanceHit>
         {
-            Assert.IsTrue(input.Collider != null && input.Collider->Filter.IsValid);
+            Assert.IsTrue(input.Collider != null);
+            if (input.Collider->Filter.IsEmpty)
+                return false;
             var leafProcessor = new BvhLeafProcessor(rigidBodies);
+
+            leafProcessor.BaseRigidBodyIndex = m_DynamicTree.NumBodies;
             bool hasHit = m_StaticTree.BoundingVolumeHierarchy.Distance(input, ref leafProcessor, ref collector);
+
+            leafProcessor.BaseRigidBodyIndex = 0;
             hasHit |= m_DynamicTree.BoundingVolumeHierarchy.Distance(input, ref leafProcessor, ref collector);
+
             return hasHit;
         }
 
         internal struct BvhLeafProcessor :
             BoundingVolumeHierarchy.IRaycastLeafProcessor,
-            BoundingVolumeHierarchy.IColliderCastLeafProcessor,
-            BoundingVolumeHierarchy.IPointDistanceLeafProcessor,
-            BoundingVolumeHierarchy.IColliderDistanceLeafProcessor,
-            BoundingVolumeHierarchy.IAabbOverlapLeafProcessor
+                BoundingVolumeHierarchy.IColliderCastLeafProcessor,
+                BoundingVolumeHierarchy.IPointDistanceLeafProcessor,
+                BoundingVolumeHierarchy.IColliderDistanceLeafProcessor,
+                BoundingVolumeHierarchy.IAabbOverlapLeafProcessor
         {
-            private readonly NativeSlice<RigidBody> m_Bodies;
+            private readonly NativeArray<RigidBody> m_Bodies;
+            public int BaseRigidBodyIndex;
 
-            public BvhLeafProcessor(NativeSlice<RigidBody> bodies)
+            public BvhLeafProcessor(NativeArray<RigidBody> bodies)
             {
                 m_Bodies = bodies;
+                BaseRigidBodyIndex = 0;
             }
 
             public bool AabbOverlap(int rigidBodyIndex, ref NativeList<int> allHits)
             {
-                allHits.Add(rigidBodyIndex);
+                allHits.Add(BaseRigidBodyIndex + rigidBodyIndex);
                 return true;
             }
 
             public bool RayLeaf<T>(RaycastInput input, int rigidBodyIndex, ref T collector) where T : struct, ICollector<RaycastHit>
             {
+                rigidBodyIndex += BaseRigidBodyIndex;
+
+                input.QueryContext.IsInitialized = true;
+                input.QueryContext.RigidBodyIndex = rigidBodyIndex;
+
                 RigidBody body = m_Bodies[rigidBodyIndex];
 
-                var worldFromBody = new MTransform(body.WorldFromBody);
-
-                // Transform the ray into body space
-                RaycastInput inputLs = input;
-                {
-                    MTransform bodyFromWorld = Inverse(worldFromBody);
-                    inputLs.Ray.Origin = Mul(bodyFromWorld, input.Ray.Origin);
-                    inputLs.Ray.Displacement = math.mul(bodyFromWorld.Rotation, input.Ray.Displacement);
-                }
-
-                float fraction = collector.MaxFraction;
-                int numHits = collector.NumHits;
-
-                if (body.CastRay(inputLs, ref collector))
-                {
-                    // Transform results back into world space
-                    collector.TransformNewHits(numHits, fraction, worldFromBody, rigidBodyIndex);
-                    return true;
-                }
-                return false;
+                return body.CastRay(input, ref collector);
             }
 
             public unsafe bool ColliderCastLeaf<T>(ColliderCastInput input, int rigidBodyIndex, ref T collector)
                 where T : struct, ICollector<ColliderCastHit>
             {
+                rigidBodyIndex += BaseRigidBodyIndex;
+
+                input.QueryContext.IsInitialized = true;
+                input.QueryContext.RigidBodyIndex = rigidBodyIndex;
+
                 RigidBody body = m_Bodies[rigidBodyIndex];
 
-                // Transform the input into body space
-                var worldFromBody = new MTransform(body.WorldFromBody);
-                MTransform bodyFromWorld = Inverse(worldFromBody);
-                var inputLs = new ColliderCastInput
-                {
-                    Collider = input.Collider,
-                    Orientation = math.mul(math.inverse(body.WorldFromBody.rot), input.Orientation),
-                };
-                inputLs.Ray.Origin = Mul(bodyFromWorld, input.Ray.Origin);
-                inputLs.Ray.Displacement = math.mul(bodyFromWorld.Rotation, input.Ray.Displacement);
-
-
-                float fraction = collector.MaxFraction;
-                int numHits = collector.NumHits;
-
-                if (body.CastCollider(inputLs, ref collector))
-                {
-                    // Transform results back into world space
-                    collector.TransformNewHits(numHits, fraction, worldFromBody, rigidBodyIndex);
-                    return true;
-                }
-                return false;
+                return body.CastCollider(input, ref collector);
             }
 
             public bool DistanceLeaf<T>(PointDistanceInput input, int rigidBodyIndex, ref T collector)
                 where T : struct, ICollector<DistanceHit>
             {
+                rigidBodyIndex += BaseRigidBodyIndex;
+
+                input.QueryContext.IsInitialized = true;
+                input.QueryContext.RigidBodyIndex = rigidBodyIndex;
+
                 RigidBody body = m_Bodies[rigidBodyIndex];
 
-                // Transform the input into body space
-                var worldFromBody = new MTransform(body.WorldFromBody);
-                MTransform bodyFromWorld = Inverse(worldFromBody);
-                var inputLs = new PointDistanceInput
-                {
-                    Position = Mul(bodyFromWorld, input.Position),
-                    MaxDistance = input.MaxDistance,
-                    Filter = input.Filter
-                };
-
-                float fraction = collector.MaxFraction;
-                int numHits = collector.NumHits;
-
-                if (body.CalculateDistance(inputLs, ref collector))
-                {
-                    // Transform results back into world space
-                    collector.TransformNewHits(numHits, fraction, worldFromBody, rigidBodyIndex);
-                    return true;
-                }
-                return false;
+                return body.CalculateDistance(input, ref collector);
             }
 
             public unsafe bool DistanceLeaf<T>(ColliderDistanceInput input, int rigidBodyIndex, ref T collector)
                 where T : struct, ICollector<DistanceHit>
             {
+                rigidBodyIndex += BaseRigidBodyIndex;
+
+                input.QueryContext.IsInitialized = true;
+                input.QueryContext.RigidBodyIndex = rigidBodyIndex;
+
                 RigidBody body = m_Bodies[rigidBodyIndex];
 
-                // Transform the input into body space
-                var worldFromBody = new MTransform(body.WorldFromBody);
-                MTransform bodyFromWorld = Inverse(worldFromBody);
-                var inputLs = new ColliderDistanceInput
-                {
-                    Collider = input.Collider,
-                    Transform = new RigidTransform(
-                        math.mul(math.inverse(body.WorldFromBody.rot), input.Transform.rot),
-                        Mul(bodyFromWorld, input.Transform.pos)),
-                    MaxDistance = input.MaxDistance
-                };
-
-                float fraction = collector.MaxFraction;
-                int numHits = collector.NumHits;
-
-                if (body.CalculateDistance(inputLs, ref collector))
-                {
-                    // Transform results back into world space
-                    collector.TransformNewHits(numHits, fraction, worldFromBody, rigidBodyIndex);
-                    return true;
-                }
-                return false;
+                return body.CalculateDistance(input, ref collector);
             }
 
             public unsafe void AabbLeaf<T>(OverlapAabbInput input, int rigidBodyIndex, ref T collector)
                 where T : struct, IOverlapCollector
             {
+                rigidBodyIndex += BaseRigidBodyIndex;
                 RigidBody body = m_Bodies[rigidBodyIndex];
-                if (body.Collider != null && CollisionFilter.IsCollisionEnabled(input.Filter, body.Collider->Filter))
+                if (body.Collider.IsCreated && CollisionFilter.IsCollisionEnabled(input.Filter, body.Collider.Value.Filter))
                 {
                     collector.AddRigidBodyIndices(&rigidBodyIndex, 1);
                 }
@@ -561,17 +666,49 @@ namespace Unity.Physics
 
         #region Jobs
 
+        // Builds the broadphase in a single job.
+        [BurstCompile]
+        struct BuildBroadphaseJob : IJob
+        {
+            [ReadOnly] public NativeArray<RigidBody> StaticBodies;
+            [ReadOnly] public NativeArray<RigidBody> DynamicBodies;
+            [ReadOnly] public NativeArray<MotionVelocity> MotionVelocities;
+            [ReadOnly] public float CollisionTolerance;
+            [ReadOnly] public float TimeStep;
+            [ReadOnly] public float3 Gravity;
+            [ReadOnly] public NativeArray<int> BuildStaticTree;
+
+            public Broadphase Broadphase;
+
+            public void Execute()
+            {
+                Broadphase.Build(StaticBodies, DynamicBodies, MotionVelocities, CollisionTolerance, TimeStep, Gravity, BuildStaticTree[0] == 1);
+            }
+        }
+
+        // Writes pairs of overlapping broadphase AABBs to a stream, in a single job.
+        [BurstCompile]
+        struct FindOverlapsJob : IJob
+        {
+            [ReadOnly] public Broadphase Broadphase;
+            public NativeStream.Writer DynamicVsDynamicPairsWriter;
+            public NativeStream.Writer StaticVsDynamicPairsWriter;
+
+            public void Execute()
+            {
+                Broadphase.FindOverlaps(ref DynamicVsDynamicPairsWriter, ref StaticVsDynamicPairsWriter);
+            }
+        }
+
         // Allocate memory for pair indices
         [BurstCompile]
         struct AllocateDynamicVsStaticNodePairs : IJob
         {
+            [ReadOnly] public NativeArray<int> dynamicBranchCount;
+            [ReadOnly] public NativeArray<int> staticBranchCount;
+
             public NativeList<int2> dynamicVsDynamicNodePairIndices;
             public NativeList<int2> staticVsDynamicNodePairIndices;
-
-            [ReadOnly]
-            public NativeArray<int> dynamicBranchCount;
-            [ReadOnly]
-            public NativeArray<int> staticBranchCount;
 
             public void Execute()
             {
@@ -583,53 +720,60 @@ namespace Unity.Physics
             }
         }
 
-
         // Reads broadphase data from dynamic rigid bodies
         [BurstCompile]
-        struct BuildDynamicBodyDataJob : IJobParallelFor
+        struct PrepareDynamicBodyDataJob : IJobParallelFor
         {
-            [ReadOnly] public NativeSlice<RigidBody> RigidBodies;
-            [ReadOnly] public NativeSlice<MotionVelocity> MotionVelocities;
-            [ReadOnly] public NativeSlice<MotionData> MotionDatas;
+            [ReadOnly] public NativeArray<RigidBody> RigidBodies;
+            [ReadOnly] public NativeArray<MotionVelocity> MotionVelocities;
             [ReadOnly] public float TimeStep;
             [ReadOnly] public float3 Gravity;
             [ReadOnly] public float AabbMargin;
 
-            public NativeArray<PointAndIndex> Lookup;
+            public NativeArray<PointAndIndex> Points;
             public NativeArray<Aabb> Aabbs;
-            [NativeDisableContainerSafetyRestriction]
-            public NativeSlice<CollisionFilter> FiltersOut;
+            public NativeArray<CollisionFilter> FiltersOut;
+            public NativeArray<bool> RespondsToCollisionOut;
 
             public unsafe void Execute(int index)
             {
-                RigidBody body = RigidBodies[index];
+                ExecuteImpl(index, AabbMargin, Gravity, TimeStep, RigidBodies, MotionVelocities, Aabbs, Points, FiltersOut, RespondsToCollisionOut);
+            }
+
+            internal static unsafe void ExecuteImpl(int index, float aabbMargin, float3 gravity, float timeStep,
+                NativeArray<RigidBody> rigidBodies, NativeArray<MotionVelocity> motionVelocities,
+                NativeArray<Aabb> aabbs, NativeArray<PointAndIndex> points,
+                NativeArray<CollisionFilter> filtersOut, NativeArray<bool> respondsToCollisionOut)
+            {
+                RigidBody body = rigidBodies[index];
 
                 Aabb aabb;
-                if (body.Collider != null)
+                if (body.Collider.IsCreated)
                 {
-                    var mv = MotionVelocities[index];
-                    var md = MotionDatas[index];
+                    var mv = motionVelocities[index];
 
                     // Apply gravity only on a copy to get proper expansion for the AABB,
                     // actual applying of gravity will be done later in the physics step
-                    mv.LinearVelocity += Gravity * TimeStep * md.GravityFactor;
+                    mv.LinearVelocity += gravity * timeStep * mv.GravityFactor;
 
-                    MotionExpansion expansion = mv.CalculateExpansion(TimeStep);
-                    aabb = expansion.ExpandAabb(body.Collider->CalculateAabb(body.WorldFromBody));
-                    aabb.Expand(AabbMargin);
+                    MotionExpansion expansion = mv.CalculateExpansion(timeStep);
+                    aabb = expansion.ExpandAabb(body.Collider.Value.CalculateAabb(body.WorldFromBody));
+                    aabb.Expand(aabbMargin);
 
-                    FiltersOut[index] = body.Collider->Filter;
+                    filtersOut[index] = body.Collider.Value.Filter;
+                    respondsToCollisionOut[index] = body.Collider.Value.RespondsToCollision;
                 }
                 else
                 {
                     aabb.Min = body.WorldFromBody.pos;
                     aabb.Max = body.WorldFromBody.pos;
 
-                    FiltersOut[index] = CollisionFilter.Zero;
+                    filtersOut[index] = CollisionFilter.Zero;
+                    respondsToCollisionOut[index] = false;
                 }
 
-                Aabbs[index] = aabb;
-                Lookup[index] = new BoundingVolumeHierarchy.PointAndIndex
+                aabbs[index] = aabb;
+                points[index] = new BoundingVolumeHierarchy.PointAndIndex
                 {
                     Position = aabb.Center,
                     Index = index
@@ -637,47 +781,73 @@ namespace Unity.Physics
             }
         }
 
+        // Prepares the NumStaticBodies value for PrepareStaticBodyDataJob
+        [BurstCompile]
+        struct PrepareNumStaticBodiesJob : IJob
+        {
+            public int NumStaticBodies;
+            public NativeArray<int> BuildStaticTree;
+            public NativeArray<int> NumStaticBodiesArray;
+
+            public void Execute()
+            {
+                if (BuildStaticTree[0] == 1)
+                {
+                    NumStaticBodiesArray[0] = NumStaticBodies;
+                }
+                else
+                {
+                    NumStaticBodiesArray[0] = 0;
+                }
+            }
+        }
+
         // Reads broadphase data from static rigid bodies
         [BurstCompile]
-        struct BuildStaticBodyDataJob : IJobParallelForDefer
+        struct PrepareStaticBodyDataJob : IJobParallelForDefer
         {
-            [ReadOnly] public NativeSlice<RigidBody> RigidBodies;
-            [ReadOnly] public int Offset;
+            [ReadOnly] public NativeArray<RigidBody> RigidBodies;
             [ReadOnly] public float AabbMargin;
 
-            [NativeDisableParallelForRestriction]
             public NativeArray<Aabb> Aabbs;
-            public NativeArray<PointAndIndex> Lookup;
-
-            [NativeDisableContainerSafetyRestriction]
-            public NativeSlice<CollisionFilter> FiltersOut;
+            public NativeArray<PointAndIndex> Points;
+            public NativeArray<CollisionFilter> FiltersOut;
+            public NativeArray<bool> RespondsToCollisionOut;
 
             public unsafe void Execute(int index)
             {
-                int staticBodyIndex = index + Offset;
-                RigidBody body = RigidBodies[index];
+                ExecuteImpl(index, AabbMargin, RigidBodies, Aabbs, Points, FiltersOut, RespondsToCollisionOut);
+            }
+
+            internal static unsafe void ExecuteImpl(int index, float aabbMargin,
+                NativeArray<RigidBody> rigidBodies, NativeArray<Aabb> aabbs, NativeArray<PointAndIndex> points,
+                NativeArray<CollisionFilter> filtersOut, NativeArray<bool> respondsToCollisionOut)
+            {
+                RigidBody body = rigidBodies[index];
 
                 Aabb aabb;
-                if (body.Collider != null)
+                if (body.Collider.IsCreated)
                 {
-                    aabb = body.Collider->CalculateAabb(body.WorldFromBody);
-                    aabb.Expand(AabbMargin);
+                    aabb = body.Collider.Value.CalculateAabb(body.WorldFromBody);
+                    aabb.Expand(aabbMargin);
 
-                    FiltersOut[index] = RigidBodies[index].Collider->Filter;
+                    filtersOut[index] = body.Collider.Value.Filter;
+                    respondsToCollisionOut[index] = body.Collider.Value.RespondsToCollision;
                 }
                 else
                 {
                     aabb.Min = body.WorldFromBody.pos;
                     aabb.Max = body.WorldFromBody.pos;
 
-                    FiltersOut[index] = CollisionFilter.Default;
+                    filtersOut[index] = CollisionFilter.Zero;
+                    respondsToCollisionOut[index] = false;
                 }
 
-                Aabbs[staticBodyIndex] = aabb;
-                Lookup[index] = new BoundingVolumeHierarchy.PointAndIndex
+                aabbs[index] = aabb;
+                points[index] = new BoundingVolumeHierarchy.PointAndIndex
                 {
                     Position = aabb.Center,
-                    Index = staticBodyIndex
+                    Index = index
                 };
             }
         }
@@ -741,7 +911,7 @@ namespace Unity.Physics
             }
         }
 
-        // An implementation of IOverlapCollector which filters and writes body pairs to a block stream
+        // An implementation of IOverlapCollector which filters and writes body pairs to a native stream
         internal unsafe struct BodyPairWriter : ITreeOverlapCollector
         {
             const int k_Capacity = 256;
@@ -751,28 +921,54 @@ namespace Unity.Physics
             fixed int m_PairsLeft[k_Capacity];
             fixed int m_PairsRight[k_Capacity];
 
-            private readonly BlockStream.Writer* m_CollidingPairs;
-            private readonly CollisionFilter* m_BodyFilters;
+            private readonly NativeStream.Writer* m_CollidingPairs;
+            private readonly CollisionFilter* m_BodyFiltersLeft;
+            private readonly CollisionFilter* m_BodyFiltersRight;
+            private readonly bool* m_BodyRespondsToCollisionLeft;
+            private readonly bool* m_BodyRespondsToCollisionRight;
+            private readonly int m_BodyIndexABase;
+            private readonly int m_BodyIndexBBase;
             private int m_Count;
 
-            public BodyPairWriter(BlockStream.Writer* collidingPairs, CollisionFilter* bodyFilters)
+            public BodyPairWriter(NativeStream.Writer* collidingPairs, CollisionFilter* bodyFiltersLeft, CollisionFilter* bodyFiltersRight,
+                                  bool* bodyRespondsToCollisionLeft, bool* bodyRespondsToCollisionRight, int bodyIndexABase, int bodyIndexBBase)
             {
                 m_CollidingPairs = collidingPairs;
-                m_BodyFilters = bodyFilters;
+                m_BodyFiltersLeft = bodyFiltersLeft;
+                m_BodyFiltersRight = bodyFiltersRight;
+                m_BodyRespondsToCollisionLeft = bodyRespondsToCollisionLeft;
+                m_BodyRespondsToCollisionRight = bodyRespondsToCollisionRight;
+                m_BodyIndexABase = bodyIndexABase;
+                m_BodyIndexBBase = bodyIndexBBase;
                 m_Count = 0;
             }
 
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
-            public void AddPairs(int4 pairsLeft, int4 pairsRight, int count)
+            public void AddPairs(int4 pairsLeft, int4 pairsRight, int count, bool swapped = false)
             {
-                fixed (int* l = m_PairsLeft)
+                if (swapped)
                 {
-                    *((int4*)(l + m_Count)) = pairsLeft;
-                }
+                    fixed(int* l = m_PairsRight)
+                    {
+                        *((int4*)(l + m_Count)) = pairsLeft;
+                    }
 
-                fixed (int* r = m_PairsRight)
+                    fixed(int* r = m_PairsLeft)
+                    {
+                        *((int4*)(r + m_Count)) = pairsRight;
+                    }
+                }
+                else
                 {
-                    *((int4*)(r + m_Count)) = pairsRight;
+                    fixed(int* l = m_PairsLeft)
+                    {
+                        *((int4*)(l + m_Count)) = pairsLeft;
+                    }
+
+                    fixed(int* r = m_PairsRight)
+                    {
+                        *((int4*)(r + m_Count)) = pairsRight;
+                    }
                 }
 
                 m_Count += count;
@@ -781,12 +977,12 @@ namespace Unity.Physics
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
             public void AddPairs(int pairLeft, int4 pairsRight, int countR)
             {
-                fixed (int* l = m_PairsLeft)
+                fixed(int* l = m_PairsLeft)
                 {
                     *((int4*)(l + m_Count)) = new int4(pairLeft);
                 }
 
-                fixed (int* r = m_PairsRight)
+                fixed(int* r = m_PairsRight)
                 {
                     *((int4*)(r + m_Count)) = pairsRight;
                 }
@@ -813,17 +1009,24 @@ namespace Unity.Physics
             {
                 if (m_Count != 0)
                 {
-                    fixed (int* l = m_PairsLeft)
+                    fixed(int* l = m_PairsLeft)
                     {
-                        fixed (int* r = m_PairsRight)
+                        fixed(int* r = m_PairsRight)
                         {
                             for (int i = 0; i < m_Count; i++)
                             {
-                                var bodyIndexPair = new BodyIndexPair { BodyAIndex = l[i], BodyBIndex = r[i] };
-
-                                if (CollisionFilter.IsCollisionEnabled(m_BodyFilters[bodyIndexPair.BodyAIndex], m_BodyFilters[bodyIndexPair.BodyBIndex]))
+                                int bodyALocalIndex = l[i];
+                                int bodyBLocalIndex = r[i];
+                                if (m_BodyRespondsToCollisionLeft[bodyALocalIndex] && m_BodyRespondsToCollisionRight[bodyBLocalIndex])
                                 {
-                                    m_CollidingPairs->Write(bodyIndexPair);
+                                    if (CollisionFilter.IsCollisionEnabled(m_BodyFiltersLeft[bodyALocalIndex], m_BodyFiltersRight[bodyBLocalIndex]))
+                                    {
+                                        m_CollidingPairs->Write(new BodyIndexPair
+                                        {
+                                            BodyIndexA = bodyALocalIndex + m_BodyIndexABase,
+                                            BodyIndexB = bodyBLocalIndex + m_BodyIndexBBase
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -836,133 +1039,64 @@ namespace Unity.Physics
 
         // Writes pairs of overlapping broadphase AABBs to a stream.
         [BurstCompile]
-        internal unsafe struct DynamicVsDynamicFindOverlappingPairsJob : IJobParallelForDefer
+        internal struct DynamicVsDynamicFindOverlappingPairsJob : IJobParallelForDefer
         {
-            [ReadOnly] public NativeArray<Node> DynamicNodes;
-            [ReadOnly] public NativeArray<CollisionFilter> DynamicNodeFilters;
-            [ReadOnly] public NativeArray<CollisionFilter> BodyFilters;
+            [ReadOnly] public Tree DynamicTree;
             [ReadOnly] public NativeArray<int2> NodePairIndices;
-
-            public BlockStream.Writer PairWriter;
+            public NativeStream.Writer PairWriter;
 
             public void Execute(int index)
             {
                 PairWriter.BeginForEachIndex(index);
 
                 int2 pair = NodePairIndices[index];
+                ExecuteImpl(pair, DynamicTree, ref PairWriter);
 
-                var bodyFiltersPtr = (CollisionFilter*)BodyFilters.GetUnsafeReadOnlyPtr();
-                var bufferedPairs = new BodyPairWriter((BlockStream.Writer*)UnsafeUtility.AddressOf(ref PairWriter), bodyFiltersPtr);
-
-                new BoundingVolumeHierarchy(DynamicNodes, DynamicNodeFilters).SelfBvhOverlap(ref bufferedPairs, pair.x, pair.y);
-
-                bufferedPairs.Close();
                 PairWriter.EndForEachIndex();
+            }
+
+            internal static unsafe void ExecuteImpl(int2 pair, Tree dynamicTree, ref NativeStream.Writer pairWriter)
+            {
+                var bodyFilters = (CollisionFilter*)dynamicTree.BodyFilters.GetUnsafeReadOnlyPtr();
+                var bodyRespondsToCollision = (bool*)dynamicTree.RespondsToCollision.GetUnsafeReadOnlyPtr();
+                var bufferedPairs = new BodyPairWriter((NativeStream.Writer*)UnsafeUtility.AddressOf(ref pairWriter), bodyFilters, bodyFilters, bodyRespondsToCollision, bodyRespondsToCollision, 0, 0);
+                new BoundingVolumeHierarchy(dynamicTree.Nodes, dynamicTree.NodeFilters).SelfBvhOverlap(ref bufferedPairs, pair.x, pair.y);
+                bufferedPairs.Close();
             }
         }
 
+        // Writes pairs of overlapping broadphase AABBs to a stream.
         [BurstCompile]
-        unsafe struct StaticVsDynamicFindOverlappingPairsJob : IJobParallelForDefer
+        struct StaticVsDynamicFindOverlappingPairsJob : IJobParallelForDefer
         {
-            [ReadOnly] public NativeArray<BoundingVolumeHierarchy.Node> StaticNodes;
-            [ReadOnly] public NativeArray<BoundingVolumeHierarchy.Node> DynamicNodes;
-
-            [ReadOnly] public NativeArray<CollisionFilter> StaticNodeFilters;
-            [ReadOnly] public NativeArray<CollisionFilter> DynamicNodeFilters;
-            [ReadOnly] public NativeArray<CollisionFilter> BodyFilters;
-
+            [ReadOnly] public Tree StaticTree;
+            [ReadOnly] public Tree DynamicTree;
             [ReadOnly] public NativeArray<int2> NodePairIndices;
-
-            public BlockStream.Writer PairWriter;
+            public NativeStream.Writer PairWriter;
 
             public void Execute(int index)
             {
                 PairWriter.BeginForEachIndex(index);
 
                 int2 pair = NodePairIndices[index];
+                ExecuteImpl(pair, StaticTree, DynamicTree, ref PairWriter);
 
-                var bodyFiltersPtr = (CollisionFilter*)BodyFilters.GetUnsafeReadOnlyPtr();
-                var bufferedPairs = new BodyPairWriter((BlockStream.Writer*)UnsafeUtility.AddressOf(ref PairWriter), bodyFiltersPtr);
-
-                var staticBvh = new BoundingVolumeHierarchy(StaticNodes, StaticNodeFilters);
-                var dynamicBvh = new BoundingVolumeHierarchy(DynamicNodes, DynamicNodeFilters);
-
-                staticBvh.BvhOverlap(ref bufferedPairs, dynamicBvh, pair.x, pair.y);
-
-                bufferedPairs.Close();
                 PairWriter.EndForEachIndex();
             }
 
-        }
-
-        // In case static bodies haven't changed, but dynamic bodies did
-        // we need to move body filter info by an offset defined by 
-        // number of dynamic bodies count diff.
-        [BurstCompile]
-        struct AdjustStaticBodyFilters : IJob
-        {
-            [ReadOnly] public int NumDynamicBodiesDiff;
-            [ReadOnly] public int NumStaticBodies;
-            [ReadOnly] public int NumDynamicBodies;
-            [ReadOnly] public NativeArray<int> HaveStaticBodiesChanged;
-            [ReadOnly] [DeallocateOnJobCompletion] public NativeArray<CollisionFilter> PreviousFrameBodyFilters;
-
-            // Static & dynamic BodyFilters can be written to in parallel
-            [NativeDisableContainerSafetyRestriction] public NativeArray<CollisionFilter> BodyFilters;
-
-            public void Execute()
+            internal static unsafe void ExecuteImpl(int2 pair, Tree staticTree, Tree dynamicTree, ref NativeStream.Writer pairWriter)
             {
-                if (HaveStaticBodiesChanged[0] == 1 || NumDynamicBodiesDiff == 0)
-                {
-                    return;
-                }
+                var staticBvh = new BoundingVolumeHierarchy(staticTree.Nodes, staticTree.NodeFilters);
+                var dynamicBvh = new BoundingVolumeHierarchy(dynamicTree.Nodes, dynamicTree.NodeFilters);
 
-                int previousFrameNumDynamicBodies = NumDynamicBodies - NumDynamicBodiesDiff;
+                var bodyPairWriter = new BodyPairWriter((NativeStream.Writer*)UnsafeUtility.AddressOf(ref pairWriter),
+                    (CollisionFilter*)staticTree.BodyFilters.GetUnsafeReadOnlyPtr(), (CollisionFilter*)dynamicTree.BodyFilters.GetUnsafeReadOnlyPtr(),
+                    (bool*)staticTree.RespondsToCollision.GetUnsafeReadOnlyPtr(), (bool*)dynamicTree.RespondsToCollision.GetUnsafeReadOnlyPtr(),
+                    dynamicTree.NumBodies, 0);
 
-                for (int i = 0; i < NumStaticBodies; i++)
-                {
-                    BodyFilters[NumDynamicBodies + i] = PreviousFrameBodyFilters[previousFrameNumDynamicBodies + i];
-                }
-            }
-        }
+                staticBvh.BvhOverlap(ref bodyPairWriter, dynamicBvh, pair.x, pair.y);
 
-        // In case static bodies haven't changed, but dynamic bodies did
-        // we can keep the static tree as it is, we just need to update
-        // indices of static rigid bodies by fixed offset in all leaf nodes.
-        [BurstCompile]
-        unsafe struct AdjustBodyIndicesJob : IJob
-        {
-            [ReadOnly] public int NumDynamicBodiesDiff;
-            [ReadOnly] public int NumStaticNodes;
-            [ReadOnly] public NativeArray<int> HaveStaticBodiesChanged;
-
-            [NativeDisableContainerSafetyRestriction]
-            public NativeArray<Node> StaticNodes;
-
-            public void Execute()
-            {
-                if (HaveStaticBodiesChanged[0] == 1 || NumDynamicBodiesDiff == 0)
-                {
-                    return;
-                }
-
-                var staticNodesPtr = (Node*)StaticNodes.GetUnsafePtr();
-
-                for (int nodeIndex = 0; nodeIndex < NumStaticNodes; nodeIndex++)
-                {
-                    if (staticNodesPtr[nodeIndex].IsLeaf)
-                    {
-                        staticNodesPtr[nodeIndex].Data[0] += NumDynamicBodiesDiff;
-
-                        for (int i = 1; i < 4; i++)
-                        {
-                            if (staticNodesPtr[nodeIndex].IsLeafValid(i))
-                            {
-                                staticNodesPtr[nodeIndex].Data[i] += NumDynamicBodiesDiff;
-                            }
-                        }
-                    }
-                }
+                bodyPairWriter.Close();
             }
         }
 

@@ -1,5 +1,4 @@
-﻿using System;
-using Unity.Collections;
+﻿using Unity.Collections;
 using Unity.Mathematics;
 using UnityEngine.Assertions;
 
@@ -19,40 +18,18 @@ namespace Unity.Physics
         // Internal state
         public int Priority;
         public bool Touched;
+        public bool IsTooSteep;
+        public bool IsMaxSlope;
     }
 
     public static class SimplexSolver
     {
-        [Obsolete("SimplexSolver.c_SimplexSolverEpsilon has been deprecated. (RemovedAfter 2019-10-25)")]
-        public const float c_SimplexSolverEpsilon = 0.0001f;
-
         const float k_Epsilon = 0.0001f;
 
-        [Obsolete("SimplexSolver.Solve() taking the respectMinDeltaTime has been deprecated. Use the new SimplexSolver.Solve() method that takes minDeltaTime instead. (RemovedAfter 2019-10-25)")]
-        public static unsafe void Solve(PhysicsWorld world, float deltaTime, float3 up, int numConstraints,
-            ref NativeArray<SurfaceConstraintInfo> constraints, ref float3 position, ref float3 velocity, out float integratedTime, bool respectMinDeltaTime = true)
-        {
-            float minDeltaTime = 0.0f;
-            if (math.lengthsq(velocity) > k_Epsilon)
-            {
-                if (respectMinDeltaTime)
-                {
-                    // Min delta time to travel at least 1cm
-                    minDeltaTime = 0.01f / math.length(velocity);
-                }
-                else
-                {
-                    minDeltaTime = deltaTime;
-                }
-            }
-
-            // If velocity is exactly -up, it means we are checking for support.
-            bool useConstraintVelocities = !(velocity.Equals(-up));
-            Solve(world, deltaTime, minDeltaTime, up, numConstraints, ref constraints, ref position, ref velocity, out integratedTime, useConstraintVelocities);
-        }
-
-        public static unsafe void Solve(PhysicsWorld world, float deltaTime, float minDeltaTime, float3 up, int numConstraints,
-            ref NativeArray<SurfaceConstraintInfo> constraints, ref float3 position, ref float3 velocity, out float integratedTime, bool useConstraintVelocities = true)
+        public static unsafe void Solve(
+            float deltaTime, float minDeltaTime, float3 up, float maxVelocity,
+            NativeList<SurfaceConstraintInfo> constraints, ref float3 position, ref float3 velocity, out float integratedTime, bool useConstraintVelocities = true
+        )
         {
             // List of planes to solve against (up to 4)
             SurfaceConstraintInfo* supportPlanes = stackalloc SurfaceConstraintInfo[4];
@@ -61,13 +38,16 @@ namespace Unity.Physics
             float remainingTime = deltaTime;
             float currentTime = 0.0f;
 
+            // Clamp the input velocity to max movement speed
+            ClampToMaxLength(maxVelocity, ref velocity);
+
             while (remainingTime > 0.0f)
             {
                 int hitIndex = -1;
                 float minCollisionTime = remainingTime;
 
                 // Iterate over constraints and solve them
-                for (int i = 0; i < numConstraints; i++)
+                for (int i = 0; i < constraints.Length; i++)
                 {
                     if (constraints[i].Touched) continue;
 
@@ -89,8 +69,7 @@ namespace Unity.Physics
                     }
                 }
 
-                // Integrate if at least 100 microseconds to hit
-                if (minCollisionTime > 1e-4f)
+                // Integrate
                 {
                     currentTime += minCollisionTime;
                     remainingTime -= minCollisionTime;
@@ -119,6 +98,9 @@ namespace Unity.Physics
 
                 // Solve support planes
                 ExamineActivePlanes(up, supportPlanes, ref numSupportPlanes, ref velocity);
+
+                // Clamp the solved velocity to max movement speed
+                ClampToMaxLength(maxVelocity, ref velocity);
 
                 // Can't handle more than 4 support planes
                 if (numSupportPlanes == 4)
@@ -412,6 +394,19 @@ namespace Unity.Physics
             var temp = plane0;
             plane0 = plane1;
             plane1 = temp;
+        }
+
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+        private static void ClampToMaxLength(float maxLength, ref float3 vector)
+        {
+            float lengthSq = math.lengthsq(vector);
+            bool maxExceeded = lengthSq > maxLength * maxLength;
+            if (maxExceeded)
+            {
+                float invLen = math.rsqrt(lengthSq);
+                float3 rescaledVector = maxLength * invLen * vector;
+                vector = rescaledVector;
+            }
         }
     }
 }

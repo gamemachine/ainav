@@ -1,22 +1,31 @@
 using System;
 using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
+using Unity.Entities;
 using Unity.Jobs;
 using Unity.Jobs.LowLevel.Unsafe;
 using Unity.Mathematics;
-using EditorBrowsableAttribute = System.ComponentModel.EditorBrowsableAttribute;
-using EditorBrowsableState = System.ComponentModel.EditorBrowsableState;
 
 namespace Unity.Physics
 {
-    // Interface for jobs that iterate through the list of Jacobians before they are solved
+    // INTERNAL UnityPhysics interface for jobs that iterate through the list of Jacobians before they are solved
+    // Important: Only use inside UnityPhysics code! Jobs in other projects should implement IJacobiansJob.
     [JobProducerType(typeof(IJacobiansJobExtensions.JacobiansJobProcess<>))]
-    public interface IJacobiansJob
+    public interface IJacobiansJobBase
     {
         // Note, multiple Jacobians can share the same header.
         void Execute(ref ModifiableJacobianHeader header, ref ModifiableContactJacobian jacobian);
         void Execute(ref ModifiableJacobianHeader header, ref ModifiableTriggerJacobian jacobian);
     }
+
+#if !HAVOK_PHYSICS_EXISTS
+
+    // Interface for jobs that iterate through the list of Jacobians before they are solved
+    public interface IJacobiansJob : IJacobiansJobBase
+    {
+    }
+
+#endif
 
     public unsafe struct ModifiableJacobianHeader
     {
@@ -24,8 +33,14 @@ namespace Unity.Physics
         public bool ModifiersChanged { get; private set; }
         public bool AngularChanged { get; private set; }
 
-        public EntityPair Entities { get; internal set; }
-        public BodyIndexPair BodyPair => m_Header->BodyPair;
+        internal EntityPair EntityPair;
+
+        public Entity EntityB => EntityPair.EntityB;
+        public Entity EntityA => EntityPair.EntityA;
+
+        public int BodyIndexB => m_Header->BodyPair.BodyIndexB;
+        public int BodyIndexA => m_Header->BodyPair.BodyIndexA;
+
         public JacobianType Type => m_Header->Type;
         public JacobianFlags Flags
         {
@@ -39,14 +54,16 @@ namespace Unity.Physics
 
                 if ((notPermitted & (userFlags ^ alreadySet)) != 0)
                 {
-                    throw new NotSupportedException("Cannot change flags which alter jacobian size");
+                    SafetyChecks.ThrowNotSupportedException("Cannot change flags which alter jacobian size");
+                    return;
                 }
 
                 m_Header->Flags = value;
             }
         }
         public bool HasColliderKeys => m_Header->HasContactManifold;
-        public ColliderKeyPair ColliderKeys => m_Header->ColliderKeys;
+        public ColliderKey ColliderKeyB => m_Header->ColliderKeys.ColliderKeyB;
+        public ColliderKey ColliderKeyA => m_Header->ColliderKeys.ColliderKeyA;
 
         public bool HasMassFactors => m_Header->HasMassFactors;
         public MassFactors MassFactors
@@ -80,16 +97,6 @@ namespace Unity.Physics
             m_Header->AccessAngularJacobian(i) = j;
             AngularChanged = true;
         }
-
-        #region Obsolete
-        [EditorBrowsable(EditorBrowsableState.Never)]
-        [Obsolete("HasMaxImpulse has been deprecated. (RemovedAfter 2019-10-15)", true)]
-        public bool HasMaxImpulse => throw new NotImplementedException();
-
-        [EditorBrowsable(EditorBrowsableState.Never)]
-        [Obsolete("MaxImpulse has been deprecated. (RemovedAfter 2019-10-15)", true)]
-        public float MaxImpulse { get => throw new NotImplementedException(); set => throw new NotImplementedException(); }
-        #endregion
     }
 
     public unsafe struct ModifiableContactJacobian
@@ -148,16 +155,6 @@ namespace Unity.Physics
                 Modified = true;
             }
         }
-
-        #region Obsolete
-        [EditorBrowsable(EditorBrowsableState.Never)]
-        [Obsolete("CoefficientOfRestitution has been deprecated. (RemovedAfter 2019-10-15)", true)]
-        public float CoefficientOfRestitution { get => throw new NotImplementedException(); set => throw new NotImplementedException(); }
-
-        [EditorBrowsable(EditorBrowsableState.Never)]
-        [Obsolete("FrictionEffectiveMassOffDiag has been deprecated. (RemovedAfter 2019-10-15)", true)]
-        public float3 FrictionEffectiveMassOffDiag { get => throw new NotImplementedException(); set => throw new NotImplementedException(); }
-        #endregion
     }
 
     public struct ModifiableTriggerJacobian
@@ -168,20 +165,27 @@ namespace Unity.Physics
     public static class IJacobiansJobExtensions
     {
 #if !HAVOK_PHYSICS_EXISTS
-        // Default IJacobiansJob.Schedule() implementation.
+        // Default Schedule() implementation for IJacobiansJob.
         public static unsafe JobHandle Schedule<T>(this T jobData, ISimulation simulation, ref PhysicsWorld world, JobHandle inputDeps)
-            where T : struct, IJacobiansJob
+            where T : struct, IJacobiansJobBase
         {
-            return ScheduleImpl(jobData, simulation, ref world, inputDeps);
+            // Should work only for UnityPhysics
+            if (simulation.Type != SimulationType.UnityPhysics)
+            {
+                return inputDeps;
+            }
+
+            return ScheduleUnityPhysicsJacobiansJob(jobData, simulation, ref world, inputDeps);
         }
+
 #else
-        // In this case IJacobiansJob.Schedule() is provided by the Havok.Physics assembly.
+        // In this case Schedule() implementation for IJacobiansJob is provided by the Havok.Physics assembly.
         // This is a stub to catch when that assembly is missing.
         //<todo.eoin.modifier Put in a link to documentation for this:
-        [Obsolete("This error occurs when HAVOK_PHYSICS_EXISTS is defined but Havok.Physics is missing from your package's asmdef references", true)]
+        [Obsolete("This error occurs when HAVOK_PHYSICS_EXISTS is defined but Havok.Physics is missing from your package's asmdef references. (DoNotRemove)", true)]
         public static unsafe JobHandle Schedule<T>(this T jobData, ISimulation simulation, ref PhysicsWorld world, JobHandle inputDeps,
             HAVOK_PHYSICS_MISSING_FROM_ASMDEF _causeCompileError = HAVOK_PHYSICS_MISSING_FROM_ASMDEF.HAVOK_PHYSICS_MISSING_FROM_ASMDEF)
-            where T : struct, IJacobiansJob
+            where T : struct, IJacobiansJobBase
         {
             return new JobHandle();
         }
@@ -192,35 +196,36 @@ namespace Unity.Physics
         }
 #endif
 
-        internal static unsafe JobHandle ScheduleImpl<T>(this T jobData, ISimulation simulation, ref PhysicsWorld world, JobHandle inputDeps)
-            where T : struct, IJacobiansJob
+        internal static unsafe JobHandle ScheduleUnityPhysicsJacobiansJob<T>(T jobData, ISimulation simulation, ref PhysicsWorld world, JobHandle inputDeps)
+            where T : struct, IJacobiansJobBase
         {
-            if (simulation.Type == SimulationType.UnityPhysics)
+            SafetyChecks.CheckAreEqualAndThrow(SimulationType.UnityPhysics, simulation.Type);
+
+            var data = new JacobiansJobData<T>
             {
-                var data = new JacobiansJobData<T>
-                {
-                    UserJobData = jobData,
-                    StreamReader = ((Simulation)simulation).m_Context.Jacobians,
-                    NumWorkItems = ((Simulation)simulation).m_Context.SolverSchedulerInfo.NumWorkItems,
-                    Bodies = world.Bodies
-                };
-                var parameters = new JobsUtility.JobScheduleParameters(
-                    UnsafeUtility.AddressOf(ref data),
-                    JacobiansJobProcess<T>.Initialize(), inputDeps, ScheduleMode.Batched);
-                return JobsUtility.Schedule(ref parameters);
-            }
-            return inputDeps;
+                UserJobData = jobData,
+                StreamReader = ((Simulation)simulation).StepContext.Jacobians.AsReader(),
+                NumWorkItems = ((Simulation)simulation).StepContext.SolverSchedulerInfo.NumWorkItems,
+                Bodies = world.Bodies
+            };
+            var parameters = new JobsUtility.JobScheduleParameters(
+#if UNITY_2020_2_OR_NEWER
+            UnsafeUtility.AddressOf(ref data), JacobiansJobProcess<T>.Initialize(), inputDeps, ScheduleMode.Single);
+#else
+                    UnsafeUtility.AddressOf(ref data), JacobiansJobProcess<T>.Initialize(), inputDeps, ScheduleMode.Batched);
+#endif
+            return JobsUtility.Schedule(ref parameters);
         }
 
         internal unsafe struct JacobiansJobData<T> where T : struct
         {
             public T UserJobData;
-            public BlockStream.Reader StreamReader;
+            public NativeStream.Reader StreamReader;
 
             [ReadOnly] public NativeArray<int> NumWorkItems;
 
-            // Disable aliasing restriction in case T has a NativeSlice of PhysicsWorld.Bodies
-            [ReadOnly, NativeDisableContainerSafetyRestriction] public NativeSlice<RigidBody> Bodies;
+            // Disable aliasing restriction in case T has a NativeArray of PhysicsWorld.Bodies
+            [ReadOnly, NativeDisableContainerSafetyRestriction] public NativeArray<RigidBody> Bodies;
 
             int m_CurrentWorkItem;
 
@@ -234,7 +239,7 @@ namespace Unity.Physics
 
             private byte* Read(int size)
             {
-                byte* dataPtr = StreamReader.Read(size);
+                byte* dataPtr = StreamReader.ReadUnsafePtr(size);
                 MoveReaderToNextForEachIndex();
                 return dataPtr;
             }
@@ -242,7 +247,7 @@ namespace Unity.Physics
             private ref T2 Read<T2>() where T2 : struct
             {
                 int size = UnsafeUtility.SizeOf<T2>();
-                return ref UnsafeUtilityEx.AsRef<T2>(Read(size));
+                return ref UnsafeUtility.AsRef<T2>(Read(size));
             }
 
             public void MoveReaderToNextForEachIndex()
@@ -256,7 +261,7 @@ namespace Unity.Physics
             }
         }
 
-        internal struct JacobiansJobProcess<T> where T : struct, IJacobiansJob
+        internal struct JacobiansJobProcess<T> where T : struct, IJacobiansJobBase
         {
             static IntPtr jobReflectionData;
 
@@ -264,8 +269,11 @@ namespace Unity.Physics
             {
                 if (jobReflectionData == IntPtr.Zero)
                 {
-                    jobReflectionData = JobsUtility.CreateJobReflectionData(typeof(JacobiansJobData<T>),
-                        typeof(T), JobType.Single, (ExecuteJobFunction)Execute);
+#if UNITY_2020_2_OR_NEWER
+                    jobReflectionData = JobsUtility.CreateJobReflectionData(typeof(JacobiansJobData<T>), typeof(T), (ExecuteJobFunction)Execute);
+#else
+                    jobReflectionData = JobsUtility.CreateJobReflectionData(typeof(JacobiansJobData<T>), typeof(T), JobType.Single, (ExecuteJobFunction)Execute);
+#endif
                 }
                 return jobReflectionData;
             }
@@ -284,10 +292,10 @@ namespace Unity.Physics
                     var h = new ModifiableJacobianHeader
                     {
                         m_Header = header,
-                        Entities = new EntityPair
+                        EntityPair = new EntityPair
                         {
-                            EntityA = jobData.Bodies[header->BodyPair.BodyAIndex].Entity,
-                            EntityB = jobData.Bodies[header->BodyPair.BodyBIndex].Entity
+                            EntityA = jobData.Bodies[header->BodyPair.BodyIndexA].Entity,
+                            EntityB = jobData.Bodies[header->BodyPair.BodyIndexB].Entity
                         }
                     };
                     if (header->Type == JacobianType.Contact)

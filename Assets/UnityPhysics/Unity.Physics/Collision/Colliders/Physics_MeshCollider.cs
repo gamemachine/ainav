@@ -1,9 +1,8 @@
-using System;
-using System.ComponentModel;
 using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
 using Unity.Mathematics;
 using Unity.Entities;
+using Unity.Burst;
 
 namespace Unity.Physics
 {
@@ -21,48 +20,32 @@ namespace Unity.Physics
         #region Construction
 
         // Create a mesh collider asset from a set of triangles
-        public static BlobAssetReference<Collider> Create(NativeArray<float3> vertices, NativeArray<int> indices) =>
-            Create(vertices, indices, CollisionFilter.Default, Material.Default);
+        public static BlobAssetReference<Collider> Create(NativeArray<float3> vertices, NativeArray<int3> triangles) =>
+            Create(vertices, triangles, CollisionFilter.Default, Material.Default);
 
-        public static BlobAssetReference<Collider> Create(NativeArray<float3> vertices, NativeArray<int> indices, CollisionFilter filter) =>
-            Create(vertices, indices, filter, Material.Default);
+        public static BlobAssetReference<Collider> Create(NativeArray<float3> vertices, NativeArray<int3> triangles, CollisionFilter filter) =>
+            Create(vertices, triangles, filter, Material.Default);
 
-        public static unsafe BlobAssetReference<Collider> Create(NativeArray<float3> vertices, NativeArray<int> indices, CollisionFilter filter, Material material)
+        public static unsafe BlobAssetReference<Collider> Create(NativeArray<float3> vertices, NativeArray<int3> triangles, CollisionFilter filter, Material material)
         {
-            int numIndices = indices.Length;
-            int numTriangles = numIndices / 3;
+            SafetyChecks.CheckTriangleIndicesInRangeAndThrow(triangles, vertices.Length, nameof(triangles));
 
             // Copy vertices
             var tempVertices = new NativeArray<float3>(vertices, Allocator.Temp);
 
-            // Copy indices
-            var tempIndices = new NativeArray<int>(numIndices, Allocator.Temp);
-            for (int iTriangle = 0; iTriangle < numTriangles; iTriangle++)
-            {
-                int iIndex0 = iTriangle * 3;
-                int iIndex1 = iIndex0 + 1;
-                int iIndex2 = iIndex0 + 2;
+            // Triangle indices - needed for WeldVertices
+            var tempIndices = new NativeArray<int>(triangles.Reinterpret<int>(UnsafeUtility.SizeOf<int3>()), Allocator.Temp);
 
-                if (indices[iIndex0] >= 0 && indices[iIndex0] < vertices.Length
-                    && indices[iIndex1] >= 0 && indices[iIndex1] < vertices.Length
-                    && indices[iIndex2] >= 0 && indices[iIndex2] < vertices.Length)
-                {
-                    tempIndices[iIndex0] = indices[iIndex0];
-                    tempIndices[iIndex1] = indices[iIndex1];
-                    tempIndices[iIndex2] = indices[iIndex2];
-                }
-                else
-                {
-                    throw new ArgumentException("Tried to create a MeshCollider with indices referencing outside vertex array");
-                }
-            }
-            
             // Build connectivity and primitives
-            
+
             NativeList<float3> uniqueVertices = MeshConnectivityBuilder.WeldVertices(tempIndices, tempVertices);
-            var connectivity = new MeshConnectivityBuilder(tempIndices, uniqueVertices);
-            NativeList<MeshConnectivityBuilder.Primitive> primitives = connectivity.EnumerateQuadDominantGeometry(tempIndices, uniqueVertices);
-            
+
+            var tempTriangleIndices = new NativeArray<int3>(triangles.Length, Allocator.Temp);
+            UnsafeUtility.MemCpy(tempTriangleIndices.GetUnsafePtr(), tempIndices.GetUnsafePtr(), tempIndices.Length * UnsafeUtility.SizeOf<int>());
+
+            var connectivity = new MeshConnectivityBuilder(tempTriangleIndices, uniqueVertices);
+            NativeList<MeshConnectivityBuilder.Primitive> primitives = connectivity.EnumerateQuadDominantGeometry(tempTriangleIndices, uniqueVertices);
+
             // Build bounding volume hierarchy
             int nodeCount = math.max(primitives.Length * 2 + 1, 2); // We need at least two nodes - an "invalid" node and a root node.
             var nodes = new NativeArray<BoundingVolumeHierarchy.Node>(nodeCount, Allocator.Temp);
@@ -103,7 +86,7 @@ namespace Unity.Physics
             // Allocate collider
             int meshDataSize = Mesh.CalculateMeshDataSize(numNodes, sections.Ranges);
             int totalColliderSize = Math.NextMultipleOf(sizeof(MeshCollider), 16) + meshDataSize;
-            
+
             MeshCollider* meshCollider = (MeshCollider*)UnsafeUtility.Malloc(totalColliderSize, 16, Allocator.Temp);
 
             // Initialize it
@@ -119,6 +102,7 @@ namespace Unity.Physics
                 ref var mesh = ref meshCollider->Mesh;
 
                 mesh.Init(nodesPtr, numNodes, sections, filter, material);
+                mesh.UpdateCachedBoundingRadius();
 
                 // Calculate combined filter
                 meshCollider->m_Header.Filter = mesh.Sections.Length > 0 ? mesh.Sections[0].Filters[0] : CollisionFilter.Default;
@@ -149,8 +133,48 @@ namespace Unity.Physics
         public CollisionType CollisionType => m_Header.CollisionType;
         public int MemorySize { get; private set; }
 
-        public CollisionFilter Filter => m_Header.Filter;
+        public CollisionFilter Filter
+        {
+            get => m_Header.Filter;
+            set
+            {
+                m_Header.Version += 1;
+                m_Header.Filter = value;
 
+                for (int i = 0; i < Mesh.Sections.Length; i++)
+                {
+                    var filters = Mesh.Sections[i].Filters;
+                    for (var j = 0; j < filters.Length; j++)
+                    {
+                        filters[j] = value;
+                    }
+                }
+            }
+        }
+
+        internal bool RespondsToCollision
+        {
+            get
+            {
+                for (int i = 0; i < Mesh.Sections.Length; i++)
+                {
+                    var materials = Mesh.Sections[i].Materials;
+                    for (var j = 0; j < materials.Length; j++)
+                    {
+                        if (materials[j].CollisionResponse != CollisionResponsePolicy.None)
+                        {
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            }
+        }
+
+        // Mass properties are calculated based on the AABB of the mesh.
+        // This is a rough approximation, but only makes a difference
+        // in the case of dynamic meshes, which shouldn't be used a lot
+        // for performance reasons.
         public MassProperties MassProperties
         {
             get
@@ -167,21 +191,34 @@ namespace Unity.Physics
                             (size.x * size.x + size.z * size.z) / 12.0f,
                             (size.x * size.x + size.y * size.y) / 12.0f)
                     },
-                    Volume = 0,
+                    Volume = size.x * size.y * size.z,
                     AngularExpansionFactor = math.length(m_Aabb.Extents) * 0.5f
                 };
             }
         }
 
+        internal float CalculateBoundingRadius(float3 pivot)
+        {
+            return math.distance(pivot, Mesh.BoundingVolumeHierarchy.Domain.Center) + Mesh.m_BoundingRadius;
+        }
+
         public Aabb CalculateAabb()
         {
-            return m_Aabb;
+            return CalculateAabb(RigidTransform.identity);
         }
 
         public Aabb CalculateAabb(RigidTransform transform)
         {
-            // TODO: Store a convex hull wrapping the mesh, and use that to calculate tighter AABBs?
-            return Math.TransformAabb(transform, m_Aabb);
+            var outAabb = Math.TransformAabb(transform, m_Aabb);
+            float3 center = outAabb.Center;
+            Aabb sphereAabb = new Aabb
+            {
+                Min = new float3(center - Mesh.m_BoundingRadius),
+                Max = new float3(center + Mesh.m_BoundingRadius)
+            };
+            outAabb.Intersect(sphereAabb);
+
+            return outAabb;
         }
 
         // Cast a ray against this collider.
@@ -190,7 +227,7 @@ namespace Unity.Physics
         public bool CastRay(RaycastInput input, ref NativeList<RaycastHit> allHits) => QueryWrappers.RayCast(ref this, input, ref allHits);
         public unsafe bool CastRay<T>(RaycastInput input, ref T collector) where T : struct, ICollector<RaycastHit>
         {
-            fixed (MeshCollider* target = &this)
+            fixed(MeshCollider* target = &this)
             {
                 return RaycastQueries.RayCollider(input, (Collider*)target, ref collector);
             }
@@ -202,7 +239,7 @@ namespace Unity.Physics
         public bool CastCollider(ColliderCastInput input, ref NativeList<ColliderCastHit> allHits) => QueryWrappers.ColliderCast(ref this, input, ref allHits);
         public unsafe bool CastCollider<T>(ColliderCastInput input, ref T collector) where T : struct, ICollector<ColliderCastHit>
         {
-            fixed (MeshCollider* target = &this)
+            fixed(MeshCollider* target = &this)
             {
                 return ColliderCastQueries.ColliderCollider(input, (Collider*)target, ref collector);
             }
@@ -214,7 +251,7 @@ namespace Unity.Physics
         public bool CalculateDistance(PointDistanceInput input, ref NativeList<DistanceHit> allHits) => QueryWrappers.CalculateDistance(ref this, input, ref allHits);
         public unsafe bool CalculateDistance<T>(PointDistanceInput input, ref T collector) where T : struct, ICollector<DistanceHit>
         {
-            fixed (MeshCollider* target = &this)
+            fixed(MeshCollider* target = &this)
             {
                 return DistanceQueries.PointCollider(input, (Collider*)target, ref collector);
             }
@@ -226,13 +263,69 @@ namespace Unity.Physics
         public bool CalculateDistance(ColliderDistanceInput input, ref NativeList<DistanceHit> allHits) => QueryWrappers.CalculateDistance(ref this, input, ref allHits);
         public unsafe bool CalculateDistance<T>(ColliderDistanceInput input, ref T collector) where T : struct, ICollector<DistanceHit>
         {
-            fixed (MeshCollider* target = &this)
+            fixed(MeshCollider* target = &this)
             {
                 return DistanceQueries.ColliderCollider(input, (Collider*)target, ref collector);
             }
         }
 
+        #region GO API Queries
+
+        // Interfaces that represent queries that exist in the GameObjects world.
+
+        public bool CheckSphere(float3 position, float radius, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default)
+            => QueryWrappers.CheckSphere(ref this, position, radius, filter, queryInteraction);
+        public bool OverlapSphere(float3 position, float radius, ref NativeList<DistanceHit> outHits, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default)
+            => QueryWrappers.OverlapSphere(ref this, position, radius, ref outHits, filter, queryInteraction);
+        public bool OverlapSphereCustom<T>(float3 position, float radius, ref T collector, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default) where T : struct, ICollector<DistanceHit>
+            => QueryWrappers.OverlapSphereCustom(ref this, position, radius, ref collector, filter, queryInteraction);
+
+        public bool CheckCapsule(float3 point1, float3 point2, float radius, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default)
+            => QueryWrappers.CheckCapsule(ref this, point1, point2, radius, filter, queryInteraction);
+        public bool OverlapCapsule(float3 point1, float3 point2, float radius, ref NativeList<DistanceHit> outHits, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default)
+            => QueryWrappers.OverlapCapsule(ref this, point1, point2, radius, ref outHits, filter, queryInteraction);
+        public bool OverlapCapsuleCustom<T>(float3 point1, float3 point2, float radius, ref T collector, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default) where T : struct, ICollector<DistanceHit>
+            => QueryWrappers.OverlapCapsuleCustom(ref this, point1, point2, radius, ref collector, filter, queryInteraction);
+
+        public bool CheckBox(float3 center, quaternion orientation, float3 halfExtents, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default)
+            => QueryWrappers.CheckBox(ref this, center, orientation, halfExtents, filter, queryInteraction);
+        public bool OverlapBox(float3 center, quaternion orientation, float3 halfExtents, ref NativeList<DistanceHit> outHits, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default)
+            => QueryWrappers.OverlapBox(ref this, center, orientation, halfExtents, ref outHits, filter, queryInteraction);
+        public bool OverlapBoxCustom<T>(float3 center, quaternion orientation, float3 halfExtents, ref T collector, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default) where T : struct, ICollector<DistanceHit>
+            => QueryWrappers.OverlapBoxCustom(ref this, center, orientation, halfExtents, ref collector, filter, queryInteraction);
+
+        public bool SphereCast(float3 origin, float radius, float3 direction, float maxDistance, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default)
+            => QueryWrappers.SphereCast(ref this, origin, radius, direction, maxDistance, filter, queryInteraction);
+        public bool SphereCast(float3 origin, float radius, float3 direction, float maxDistance, out ColliderCastHit hitInfo, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default)
+            => QueryWrappers.SphereCast(ref this, origin, radius, direction, maxDistance, out hitInfo, filter, queryInteraction);
+        public bool SphereCastAll(float3 origin, float radius, float3 direction, float maxDistance, ref NativeList<ColliderCastHit> outHits, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default)
+            => QueryWrappers.SphereCastAll(ref this, origin, radius, direction, maxDistance, ref outHits, filter, queryInteraction);
+        public bool SphereCastCustom<T>(float3 origin, float radius, float3 direction, float maxDistance, ref T collector, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default) where T : struct, ICollector<ColliderCastHit>
+            => QueryWrappers.SphereCastCustom(ref this, origin, radius, direction, maxDistance, ref collector, filter, queryInteraction);
+
+        public bool BoxCast(float3 center, quaternion orientation, float3 halfExtents, float3 direction, float maxDistance, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default)
+            => QueryWrappers.BoxCast(ref this, center, orientation, halfExtents, direction, maxDistance, filter, queryInteraction);
+        public bool BoxCast(float3 center, quaternion orientation, float3 halfExtents, float3 direction, float maxDistance, out ColliderCastHit hitInfo, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default)
+            => QueryWrappers.BoxCast(ref this, center, orientation, halfExtents, direction, maxDistance, out hitInfo, filter, queryInteraction);
+        public bool BoxCastAll(float3 center, quaternion orientation, float3 halfExtents, float3 direction, float maxDistance, ref NativeList<ColliderCastHit> outHits, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default)
+            => QueryWrappers.BoxCastAll(ref this, center, orientation, halfExtents, direction, maxDistance, ref outHits, filter, queryInteraction);
+        public bool BoxCastCustom<T>(float3 center, quaternion orientation, float3 halfExtents, float3 direction, float maxDistance, ref T collector, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default) where T : struct, ICollector<ColliderCastHit>
+            => QueryWrappers.BoxCastCustom(ref this, center, orientation, halfExtents, direction, maxDistance, ref collector, filter, queryInteraction);
+
+        public bool CapsuleCast(float3 point1, float3 point2, float radius, float3 direction, float maxDistance, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default)
+            => QueryWrappers.CapsuleCast(ref this, point1, point2, radius, direction, maxDistance, filter, queryInteraction);
+        public bool CapsuleCast(float3 point1, float3 point2, float radius, float3 direction, float maxDistance, out ColliderCastHit hitInfo, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default)
+            => QueryWrappers.CapsuleCast(ref this, point1, point2, radius, direction, maxDistance, out hitInfo, filter, queryInteraction);
+        public bool CapsuleCastAll(float3 point1, float3 point2, float radius, float3 direction, float maxDistance, ref NativeList<ColliderCastHit> outHits, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default)
+            => QueryWrappers.CapsuleCastAll(ref this, point1, point2, radius, direction, maxDistance, ref outHits, filter, queryInteraction);
+        public bool CapsuleCastCustom<T>(float3 point1, float3 point2, float radius, float3 direction, float maxDistance, ref T collector, CollisionFilter filter, QueryInteraction queryInteraction = QueryInteraction.Default) where T : struct, ICollector<ColliderCastHit>
+            => QueryWrappers.CapsuleCastCustom(ref this, point1, point2, radius, direction, maxDistance, ref collector, filter, queryInteraction);
+
+        #endregion
+
         public uint NumColliderKeyBits { get; private set; }
+
+        internal uint TotalNumColliderKeyBits => NumColliderKeyBits;
 
         public bool GetChild(ref ColliderKey key, out ChildCollider child)
         {
@@ -243,7 +336,7 @@ namespace Unity.Physics
 
                 Mesh.GetPrimitive(primitiveKey, out float3x4 vertices, out Mesh.PrimitiveFlags flags, out CollisionFilter filter, out Material material);
 
-                if (Mesh.IsPrimitveFlagSet(flags, Mesh.PrimitiveFlags.IsQuad))
+                if (Mesh.IsPrimitiveFlagSet(flags, Mesh.PrimitiveFlags.IsQuad))
                 {
                     child = new ChildCollider(vertices[0], vertices[1], vertices[2], vertices[3], filter, material);
                 }
@@ -264,10 +357,10 @@ namespace Unity.Physics
             return GetChild(ref key, out leaf);
         }
 
-        public unsafe void GetLeaves<T>(ref T collector) where T : struct, ILeafColliderCollector
+        public unsafe void GetLeaves<T>([NoAlias] ref T collector) where T : struct, ILeafColliderCollector
         {
             var polygon = new PolygonCollider();
-            polygon.InitEmpty();
+            polygon.InitNoVertices(CollisionFilter.Default, Material.Default);
             if (Mesh.GetFirstPolygon(out uint meshKey, ref polygon))
             {
                 do
@@ -279,17 +372,6 @@ namespace Unity.Physics
             }
         }
 
-        #endregion
-
-        #region Obsolete
-        [EditorBrowsable(EditorBrowsableState.Never)]
-        [Obsolete("This signature has been deprecated. Use a signature passing native containers instead. (RemovedAfter 2019-10-25)")]
-        public static unsafe BlobAssetReference<Collider> Create(float3[] vertices, int[] indices, CollisionFilter? filter = null, Material? material = null)
-        {
-            var v = new NativeArray<float3>(vertices, Allocator.Temp);
-            var i = new NativeArray<int>(indices, Allocator.Temp);
-            return Create(v, i, filter ?? CollisionFilter.Default, material ?? Material.Default);
-        }
         #endregion
     }
 }
